@@ -51,6 +51,7 @@
 #include "tracker.h"
 #include "image.h"
 #include "bulk_capture.h"
+#include "v4l2_capture.h"
 
 static volatile sig_atomic_t stop;
 static void on_signal(int s) { (void)s; stop = 1; }
@@ -395,12 +396,67 @@ static void usage(int status) {
           "  --startup-timeout 1-120   first usable frame deadline (default 10s)\n"
           "  --probe-bulk              Focus 3 raw USB transfer diagnostic, then exit\n"
           "  --capture-first           Focus 3: commit and queue capture before vendor activation\n"
-          "  --capture-backend auto|bulk|libuvc  Focus 3 defaults to direct bulk reads\n"
+          "  --capture-backend auto|bulk|libuvc|v4l2  Focus 3 defaults to direct bulk reads;\n"
+          "                            v4l2 uses the kernel uvcvideo driver\n"
           "  --allow-uvc-errors        inspect full Focus 3 frames carrying UVC ERR\n"
           "  --recommit-after-activation  Focus 3 bulk: commit before and again after activation\n"
           "  --bulk-timeout 50-5000    bulk read timeout in ms (default 250)\n"
+          "  --no-clear-halt           Focus 3 bulk/libuvc: skip CLEAR_FEATURE(HALT)\n"
           "  --diagnose               print USB/UVC descriptors without activation\n");
   exit(status);
+}
+
+// Wait for Ctrl+C/SIGTERM; 1 if frames stop arriving.
+static int watch_frames(int startup_timeout) {
+  while (!stop) {
+    msleep(200);
+    // A stalled tracker (unplugged, or the XU state reset) never recovers by
+    // waiting; exit and let the service manager reinitialise it.
+    struct timespec now, previous;
+    unsigned long received, rejected, encoded;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    pthread_mutex_lock(&timing_mu);
+    previous = last_frame;
+    received = received_frames;
+    rejected = rejected_frames;
+    encoded = encoded_frames;
+    pthread_mutex_unlock(&timing_mu);
+    int deadline = encoded ? 3 : startup_timeout;
+    if (now.tv_sec - previous.tv_sec + (now.tv_nsec - previous.tv_nsec) / 1e9 > deadline) {
+      fprintf(stderr, "vft-stream: no %sframe in %ds (received=%lu rejected=%lu encoded=%lu)\n",
+              encoded ? "" : "usable startup ", deadline, received, rejected, encoded);
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* Focus 3 through the kernel uvcvideo driver, without libuvc claiming the
+ * device: XU activation, then STREAMON (commit and queued bulk reads). */
+static int stream_v4l2(unsigned bus, unsigned address, int xu_unit, int server_fd, int startup_timeout) {
+  struct v4l2_capture *capture = NULL;
+  if (v4l2_capture_open(bus, address, xu_unit, &capture)) return 1;
+  struct tracker_io io = {.context = capture, .length = v4l2_capture_xu_length(capture),
+                          .send = v4l2_capture_send, .sleep_ms = control_sleep};
+  int rc = 1;
+  if (tracker_set_state(TRACKER_FOCUS3, 1, &io)) goto done;
+  pthread_t srv;
+  if ((rc = pthread_create(&srv, NULL, server, (void *)(intptr_t)server_fd))) {
+    fprintf(stderr, "vft-stream: create HTTP server: %s\n", strerror(rc));
+    rc = 1;
+    goto done;
+  }
+  pthread_detach(srv);
+  clock_gettime(CLOCK_MONOTONIC, &last_frame);
+  rc = v4l2_capture_start(capture, on_frame, NULL) ? 1 : watch_frames(startup_timeout);
+done:
+  v4l2_capture_stop(capture);
+  if (tracker_set_state(TRACKER_FOCUS3, 0, &io)) {
+    fprintf(stderr, "vft-stream: tracker shutdown failed (device may be disconnected)\n");
+    rc = 1;
+  }
+  v4l2_capture_close(capture);
+  return rc;
 }
 
 /* VS_COMMIT. Focus 3 commits after vendor activation by default, as the
@@ -428,8 +484,8 @@ int main(int argc, char **argv) {
   int port = 8085, opt, r, pid = 0, xu_unit = 0, diagnose = 0, startup_timeout = 10;
   int bulk_diagnostic = 0, capture_first = 0;
   int backend = 0, allow_uvc_errors = 0;
-  int recommit = 0, bulk_timeout = 250, custom_bulk_timeout = 0;
-  enum { OPT_RECOMMIT = 1000, OPT_BULK_TIMEOUT };
+  int recommit = 0, bulk_timeout = 250, custom_bulk_timeout = 0, clear_halt = 1;
+  enum { OPT_RECOMMIT = 1000, OPT_BULK_TIMEOUT, OPT_NO_CLEAR_HALT };
   enum tracker_profile requested = TRACKER_AUTO;
   static const struct option options[] = {
     {"tracker", required_argument, NULL, 't'}, {"pid", required_argument, NULL, 'i'},
@@ -441,6 +497,7 @@ int main(int argc, char **argv) {
     {"allow-uvc-errors", no_argument, NULL, 'E'},
     {"recommit-after-activation", no_argument, NULL, OPT_RECOMMIT},
     {"bulk-timeout", required_argument, NULL, OPT_BULK_TIMEOUT},
+    {"no-clear-halt", no_argument, NULL, OPT_NO_CLEAR_HALT},
     {"diagnose", no_argument, NULL, 'd'}, {"help", no_argument, NULL, 'h'}, {NULL, 0, NULL, 0}
   };
   while ((opt = getopt_long(argc, argv, "p:q:rh", options, NULL)) != -1) switch (opt) {
@@ -463,11 +520,13 @@ int main(int argc, char **argv) {
         if (!strcmp(optarg, "auto")) backend = 0;
         else if (!strcmp(optarg, "bulk")) backend = 1;
         else if (!strcmp(optarg, "libuvc")) backend = 2;
+        else if (!strcmp(optarg, "v4l2")) backend = 3;
         else usage(2);
         break;
       case 'E': allow_uvc_errors = 1; break;
       case OPT_RECOMMIT: recommit = 1; break;
       case OPT_BULK_TIMEOUT: bulk_timeout = parse_number(optarg, 10, 50, 5000); custom_bulk_timeout = 1; break;
+      case OPT_NO_CLEAR_HALT: clear_halt = 0; break;
       case 'd': diagnose = 1; break;
       case 'h': usage(0); break;
       default: usage(2);
@@ -478,6 +537,11 @@ int main(int argc, char **argv) {
   if (allow_uvc_errors && (diagnose || bulk_diagnostic || backend == 2 || requested == TRACKER_VFT)) usage(2);
   if ((recommit || custom_bulk_timeout) &&
       (diagnose || bulk_diagnostic || backend == 2 || requested == TRACKER_VFT)) usage(2);
+  if (!clear_halt && (diagnose || requested == TRACKER_VFT || backend == 3)) usage(2);
+  /* The kernel driver path keeps uvcvideo bound and supports none of the
+   * libusb transfer diagnostics. */
+  if (backend == 3 && (diagnose || bulk_diagnostic || capture_first || allow_uvc_errors ||
+                       recommit || custom_bulk_timeout || requested == TRACKER_VFT)) usage(2);
 
   struct sigaction sa = {.sa_handler = on_signal};
   sigaction(SIGINT, &sa, NULL);
@@ -522,8 +586,19 @@ int main(int argc, char **argv) {
     fprintf(stderr, "vft-stream: %d matching cameras; use --tracker and --pid to select exactly one\n", matches);
     goto cleanup;
   }
-  if ((bulk_diagnostic || capture_first || backend == 1 || allow_uvc_errors || recommit || custom_bulk_timeout) && profile != TRACKER_FOCUS3) {
+  if ((bulk_diagnostic || capture_first || backend == 1 || backend == 3 || allow_uvc_errors || recommit ||
+       custom_bulk_timeout || !clear_halt) && profile != TRACKER_FOCUS3) {
     fprintf(stderr, "vft-stream: capture diagnostics require a Focus 3 tracker\n");
+    goto cleanup;
+  }
+  if (backend == 3) {
+    /* uvc_open would detach uvcvideo; only enumeration used libuvc. */
+    server_fd = open_server(port);
+    if (server_fd < 0) {
+      fprintf(stderr, "vft-stream: HTTP listen: %s\n", strerror(errno));
+      goto cleanup;
+    }
+    rc = stream_v4l2(uvc_get_bus_number(dev), uvc_get_device_address(dev), xu_unit, server_fd, startup_timeout);
     goto cleanup;
   }
   if ((r = uvc_open(dev, &h)) < 0) {
@@ -560,7 +635,7 @@ int main(int argc, char **argv) {
     if (!bulk_endpoint(h, &ctrl, &endpoint)) {
       have_endpoint = 1;
       bulk_report_link(h, &ctrl, endpoint);
-      bulk_clear_halt(h, endpoint, "before commit");
+      if (clear_halt) bulk_clear_halt(h, endpoint, "before commit");
     }
     /* Diagnostic orderings that commit before the vendor enable. */
     if ((capture_first || recommit) && commit_stream(h, &ctrl, &capture, "before")) goto cleanup;
@@ -620,28 +695,7 @@ int main(int argc, char **argv) {
     streaming = 1;
   }
 
-  rc = 0;
-  while (!stop) {
-    msleep(200);
-    // A stalled tracker (unplugged, or the XU state reset) never recovers by
-    // waiting; exit and let the service manager reinitialise it.
-    struct timespec now, previous;
-    unsigned long received, rejected, encoded;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    pthread_mutex_lock(&timing_mu);
-    previous = last_frame;
-    received = received_frames;
-    rejected = rejected_frames;
-    encoded = encoded_frames;
-    pthread_mutex_unlock(&timing_mu);
-    int deadline = encoded ? 3 : startup_timeout;
-    if (now.tv_sec - previous.tv_sec + (now.tv_nsec - previous.tv_nsec) / 1e9 > deadline) {
-      fprintf(stderr, "vft-stream: no %sframe in %ds (received=%lu rejected=%lu encoded=%lu)\n",
-              encoded ? "" : "usable startup ", deadline, received, rejected, encoded);
-      rc = 1;
-      break;
-    }
-  }
+  rc = watch_frames(startup_timeout);
 
 cleanup:
   if (streaming) {
@@ -649,7 +703,7 @@ cleanup:
     else if (capture) uvc_stream_stop(capture);
     else uvc_stop_streaming(h);
   }
-  if (have_endpoint && capture) bulk_clear_halt(h, endpoint, "stop stream");
+  if (clear_halt && have_endpoint && capture) bulk_clear_halt(h, endpoint, "stop stream");
   if (activation_attempted && tracker_set_state(profile, 0, &io)) {
     fprintf(stderr, "vft-stream: tracker shutdown failed (device may be disconnected)\n");
     rc = 1;

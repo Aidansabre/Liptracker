@@ -374,12 +374,34 @@ class Integration(unittest.TestCase):
                  ("--recommit-after-activation", "--diagnose"),
                  ("--bulk-timeout", "1000", "--probe-bulk"),
                  ("--recommit-after-activation", "--capture-backend", "libuvc"),
-                 ("--recommit-after-activation", "--tracker", "vft"))
+                 ("--recommit-after-activation", "--tracker", "vft"),
+                 ("--capture-backend", "v4l2", "--capture-first"),
+                 ("--capture-backend", "v4l2", "--diagnose"),
+                 ("--capture-backend", "v4l2", "--no-clear-halt"),
+                 ("--no-clear-halt", "--tracker", "vft"))
         for options in cases:
             with self.subTest(options=options):
                 result = subprocess.run([binary, *options], capture_output=True, timeout=5)
                 self.assertEqual(result.returncode, 2, result.stderr.decode())
                 self.assertNotIn(b"SET_CUR", result.stderr)
+
+    def test_v4l2_without_kernel_node_does_not_activate(self):
+        # No uvcvideo node in the test environment: fail before any XU write.
+        process, _, log = self.run_camera(backend="v4l2")
+        _, stderr = process.communicate(timeout=5)
+        self.assertEqual(process.returncode, 1, stderr.decode())
+        self.assertIn(b"no uvcvideo capture node for USB 001:002", stderr)
+        self.assertEqual(log.read_text(), "")
+        self.assertEqual(log.with_suffix(".events").read_text(), "")
+
+    def test_no_clear_halt(self):
+        process, port, log = self.run_camera(backend=None, options=("--no-clear-halt",))
+        self.assertEqual(self.jpeg(process, port).size, (320, 480))
+        process.send_signal(signal.SIGTERM)
+        _, stderr = process.communicate(timeout=5)
+        self.assertEqual(process.returncode, 0, stderr.decode())
+        self.assertNotIn("clear-halt", log.with_suffix(".events").read_text().splitlines())
+        self.check_shutdown(log)
 
     def test_stall_cleanup(self):
         process, _, log = self.run_camera("stall")

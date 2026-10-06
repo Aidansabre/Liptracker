@@ -59,6 +59,8 @@ uvc_error_t uvc_get_device_descriptor(uvc_device_t *dev, uvc_device_descriptor_t
   return UVC_SUCCESS;
 }
 void uvc_free_device_descriptor(uvc_device_descriptor_t *desc) { free(desc); }
+uint8_t uvc_get_bus_number(uvc_device_t *dev) { (void)dev; return 1; }
+uint8_t uvc_get_device_address(uvc_device_t *dev) { (void)dev; return 2; }
 uvc_error_t uvc_open(uvc_device_t *dev, uvc_device_handle_t **out) { (void)dev; *out = &handle; return UVC_SUCCESS; }
 void uvc_close(uvc_device_handle_t *dev) {
   assert(dev == &handle && !stream.open && !stream.started);

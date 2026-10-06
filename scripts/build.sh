@@ -66,7 +66,7 @@ fi
 "$compiler" -O2 -Wall -Wextra $static \
   -I"$prefix/include" -I"$prefix/include/libusb-1.0" \
   -I"$sources/stb-2c980bb59875b0d32144a71867fbdebb2f77cd20" \
-  "$repo/vft-stream.c" "$repo/tracker.c" "$repo/image.c" "$repo/bulk_capture.c" "$repo/uvc_bulk.c" \
+  "$repo/vft-stream.c" "$repo/tracker.c" "$repo/image.c" "$repo/bulk_capture.c" "$repo/uvc_bulk.c" "$repo/v4l2_capture.c" \
   "$prefix/lib/libuvc.a" "$prefix/lib/libusb-1.0.a" -lm -lpthread \
   -o "$repo/dist/vft-stream-$target"
 printf 'Built %s\n' "$repo/dist/vft-stream-$target"

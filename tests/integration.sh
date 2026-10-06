@@ -15,6 +15,6 @@ flags='-O2 -Wall -Wextra -Werror'
 if [ "${SANITIZE:-0}" = 1 ]; then flags="$flags -fsanitize=address,undefined -fno-omit-frame-pointer -g"; fi
 cc $flags -I"$prefix/include" -I"$prefix/include/libusb-1.0" \
   -I"$sources/stb-2c980bb59875b0d32144a71867fbdebb2f77cd20" \
-  "$repo/vft-stream.c" "$repo/tracker.c" "$repo/image.c" "$repo/bulk_capture.c" "$repo/uvc_bulk.c" "$repo/tests/fake_uvc.c" \
+  "$repo/vft-stream.c" "$repo/tracker.c" "$repo/image.c" "$repo/bulk_capture.c" "$repo/uvc_bulk.c" "$repo/v4l2_capture.c" "$repo/tests/fake_uvc.c" \
   -lm -lpthread -o "$temp/vft-stream-simulated"
 PYTHONPATH="$tools${PYTHONPATH:+:$PYTHONPATH}" python3 "$repo/tests/test_integration.py" "$temp/vft-stream-simulated"
