@@ -132,6 +132,15 @@ The default produces a static aarch64 binary for Steam Frame; `cross false` buil
 for the host. The declaration includes all new C modules. Nix itself was unavailable
 in the cloud validation environment, so the standalone build was used and verified.
 
+## GitHub releases
+
+Version tags beginning with `v` run `.github/workflows/release.yml`. The workflow
+builds native and static ARM64 binaries, runs the regression/sanitizer/integration
+checks, and publishes a hardware-test prerelease with the ARM64 executable,
+complete Steam Frame package and checksums. The first release is
+`v0.3.0-focus3.1`. The same workflow can be started manually with an existing
+version tag if needed. Physical hardware validation remains required.
+
 ## Tests and validation status
 
 ```sh
