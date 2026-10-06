@@ -240,6 +240,7 @@ static void *server(void *arg) {
 static int raw, quality = 90;
 static pthread_mutex_t timing_mu = PTHREAD_MUTEX_INITIALIZER;
 static struct timespec last_frame;
+static unsigned long received_frames, rejected_frames, encoded_frames;
 
 // Runs on libuvc's transfer thread, once per complete frame.
 static void on_frame(uvc_frame_t *f, void *user) {
@@ -248,12 +249,26 @@ static void on_frame(uvc_frame_t *f, void *user) {
   static unsigned long n;
   static time_t last_log;
 
-  if (f->frame_format != UVC_FRAME_FORMAT_YUYV)
-    return; // short/corrupt transfer; the next one will do
+  pthread_mutex_lock(&timing_mu);
+  unsigned long received = ++received_frames;
+  pthread_mutex_unlock(&timing_mu);
+  if (received == 1)
+    fprintf(stderr, "vft-stream: first callback: %ux%u format=%d stride=%zu bytes=%zu expected=%zu\n",
+            f->width, f->height, f->frame_format, f->step, f->data_bytes,
+            (size_t)f->width * f->height * 2);
 
   int ow, oh;
-  if (image_process(profile, rotation, raw, f->data, f->data_bytes, f->width,
-                    f->height, f->step, img, sizeof img, &ow, &oh)) return;
+  if (f->frame_format != UVC_FRAME_FORMAT_YUYV ||
+      image_process(profile, rotation, raw, f->data, f->data_bytes, f->width,
+                    f->height, f->step, img, sizeof img, &ow, &oh)) {
+    pthread_mutex_lock(&timing_mu);
+    unsigned long rejected = ++rejected_frames;
+    pthread_mutex_unlock(&timing_mu);
+    if (rejected <= 3)
+      fprintf(stderr, "vft-stream: rejected callback: %ux%u format=%d stride=%zu bytes=%zu\n",
+              f->width, f->height, f->frame_format, f->step, f->data_bytes);
+    return;
+  }
 
   pthread_mutex_lock(&mu);
   frame_len = 0;
@@ -265,6 +280,7 @@ static void on_frame(uvc_frame_t *f, void *user) {
   time_t now = time(NULL);
   pthread_mutex_lock(&timing_mu);
   clock_gettime(CLOCK_MONOTONIC, &last_frame);
+  encoded_frames++;
   pthread_mutex_unlock(&timing_mu);
   if (!last_log) last_log = now;
   n++;
@@ -310,6 +326,7 @@ static void usage(int status) {
           "  --pid hex                select a specific HTC product ID\n"
           "  --xu-unit 1-255          override the vendor extension unit\n"
           "  --rotation 0|90|180|270   Focus 3 degrees CCW (default 90)\n"
+          "  --startup-timeout 1-120   first usable frame deadline (default 10s)\n"
           "  --diagnose               print USB/UVC descriptors without activation\n");
   exit(status);
 }
@@ -323,11 +340,12 @@ static int parse_number(const char *text, int base, int low, int high) {
 }
 
 int main(int argc, char **argv) {
-  int port = 8085, opt, r, pid = 0, xu_unit = 0, diagnose = 0;
+  int port = 8085, opt, r, pid = 0, xu_unit = 0, diagnose = 0, startup_timeout = 10;
   enum tracker_profile requested = TRACKER_AUTO;
   static const struct option options[] = {
     {"tracker", required_argument, NULL, 't'}, {"pid", required_argument, NULL, 'i'},
     {"xu-unit", required_argument, NULL, 'u'}, {"rotation", required_argument, NULL, 'R'},
+    {"startup-timeout", required_argument, NULL, 'T'},
     {"diagnose", no_argument, NULL, 'd'}, {"help", no_argument, NULL, 'h'}, {NULL, 0, NULL, 0}
   };
   while ((opt = getopt_long(argc, argv, "p:q:rh", options, NULL)) != -1) switch (opt) {
@@ -343,6 +361,7 @@ int main(int argc, char **argv) {
       case 'i': pid = parse_number(optarg, 16, 1, 65535); break;
       case 'u': xu_unit = parse_number(optarg, 10, 1, 255); break;
       case 'R': rotation = parse_number(optarg, 10, 0, 270); if (rotation % 90) usage(2); break;
+      case 'T': startup_timeout = parse_number(optarg, 10, 1, 120); break;
       case 'd': diagnose = 1; break;
       case 'h': usage(0); break;
       default: usage(2);
@@ -357,6 +376,7 @@ int main(int argc, char **argv) {
   uvc_context_t *ctx = NULL;
   uvc_device_t **devices = NULL, *dev = NULL;
   uvc_device_handle_t *h = NULL;
+  uvc_stream_handle_t *capture = NULL;
   struct usb_control usb = {0};
   struct tracker_io io = {.context = &usb, .send = control_send, .sleep_ms = control_sleep};
   int rc = 1, activation_attempted = 0, streaming = 0, server_fd = -1;
@@ -402,12 +422,24 @@ int main(int argc, char **argv) {
   if (r < 0) goto cleanup;
   io.length = r;
 
-  uvc_stream_ctrl_t ctrl;
+  uvc_stream_ctrl_t ctrl = {0};
   if (pick_mode(h, &ctrl)) goto cleanup;
+  fprintf(stderr, "vft-stream: UVC interface=%u format=%u frame=%u interval=%u max-frame=%u max-payload=%u\n",
+          ctrl.bInterfaceNumber, ctrl.bFormatIndex, ctrl.bFrameIndex, ctrl.dwFrameInterval,
+          ctrl.dwMaxVideoFrameSize, ctrl.dwMaxPayloadTransferSize);
   server_fd = open_server(port);
   if (server_fd < 0) {
     fprintf(stderr, "vft-stream: HTTP listen: %s\n", strerror(errno));
     goto cleanup;
+  }
+  if (profile == TRACKER_FOCUS3) {
+    /* open_ctrl performs VS_COMMIT. Finish configuration before vendor enable;
+     * stream_start then queues transfers without committing the mode again. */
+    if ((r = uvc_stream_open_ctrl(h, &capture, &ctrl)) < 0) {
+      fprintf(stderr, "vft-stream: commit capture stream: %s\n", uvc_strerror(r));
+      goto cleanup;
+    }
+    fprintf(stderr, "vft-stream: UVC stream committed before Focus 3 activation\n");
   }
   activation_attempted = 1;
   if (tracker_set_state(profile, 1, &io)) goto cleanup;
@@ -420,7 +452,9 @@ int main(int argc, char **argv) {
   pthread_detach(srv);
 
   clock_gettime(CLOCK_MONOTONIC, &last_frame);
-  if ((r = uvc_start_streaming(h, &ctrl, on_frame, NULL, 0)) < 0) {
+  r = capture ? uvc_stream_start(capture, on_frame, NULL, 0) :
+                uvc_start_streaming(h, &ctrl, on_frame, NULL, 0);
+  if (r < 0) {
     fprintf(stderr, "vft-stream: start streaming: %s\n", uvc_strerror(r));
     goto cleanup;
   }
@@ -432,19 +466,28 @@ int main(int argc, char **argv) {
     // A stalled tracker (unplugged, or the XU state reset) never recovers by
     // waiting; exit and let the service manager reinitialise it.
     struct timespec now, previous;
+    unsigned long received, rejected, encoded;
     clock_gettime(CLOCK_MONOTONIC, &now);
     pthread_mutex_lock(&timing_mu);
     previous = last_frame;
+    received = received_frames;
+    rejected = rejected_frames;
+    encoded = encoded_frames;
     pthread_mutex_unlock(&timing_mu);
-    if (now.tv_sec - previous.tv_sec + (now.tv_nsec - previous.tv_nsec) / 1e9 > 3) {
-      fprintf(stderr, "vft-stream: no frame in 3s\n");
+    int deadline = encoded ? 3 : startup_timeout;
+    if (now.tv_sec - previous.tv_sec + (now.tv_nsec - previous.tv_nsec) / 1e9 > deadline) {
+      fprintf(stderr, "vft-stream: no %sframe in %ds (received=%lu rejected=%lu encoded=%lu)\n",
+              encoded ? "" : "usable startup ", deadline, received, rejected, encoded);
       rc = 1;
       break;
     }
   }
 
 cleanup:
-  if (streaming) uvc_stop_streaming(h);
+  if (streaming) {
+    if (capture) uvc_stream_stop(capture);
+    else uvc_stop_streaming(h);
+  }
   if (activation_attempted && tracker_set_state(profile, 0, &io)) {
     fprintf(stderr, "vft-stream: tracker shutdown failed (device may be disconnected)\n");
     rc = 1;
@@ -454,6 +497,7 @@ cleanup:
   pthread_cond_broadcast(&cv);
   pthread_mutex_unlock(&mu);
   if (server_fd >= 0) { shutdown(server_fd, SHUT_RDWR); close(server_fd); }
+  if (capture) uvc_stream_close(capture);
   if (h) uvc_close(h);
   if (devices) uvc_free_device_list(devices, 1);
   if (ctx) uvc_exit(ctx);

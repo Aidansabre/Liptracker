@@ -61,18 +61,40 @@ Options:
 --pid HEX               choose a specific HTC USB product ID
 --xu-unit 1–255          override the discovered extension unit
 --rotation 0|90|180|270  Focus 3 rotation in degrees CCW (default 90)
+--startup-timeout 1–120 first usable frame deadline in seconds (default 10)
 --diagnose              inspect descriptors without activating the tracker
 ```
 
 If the camera is sideways or upside-down, stop it with Ctrl+C and try another
 `--rotation` value. `-r` exposes the complete 640×481 source image for comparison.
 The Focus 3 profile does not apply the older VFT's crop or gamma correction.
-Ctrl+C/SIGTERM, activation failure, stream-start failure and the three-second
-stall watchdog attempt to turn IR off and disable streaming before releasing USB.
+Focus 3 capture commits the UVC mode before enabling the sensor and IR, then
+queues USB transfers without another mode commit. The first usable frame has a
+ten-second deadline; after capture begins, three seconds without a usable frame
+triggers shutdown. Ctrl+C/SIGTERM, activation failure, stream-start failure and
+the watchdog attempt to turn IR off and disable streaming before releasing USB.
 
 For troubleshooting, run `sudo sh diag.sh` next to the binary; it writes `diag.txt`.
-If needed, run `sudo LIBUSB_DEBUG=3 ./vft-stream --tracker focus3` locally;
-share relevant USB errors, not unrelated environment or credential information.
+Startup prints negotiated frame/payload sizes and the first callback's dimensions,
+stride and byte count. A watchdog exit includes received, rejected and encoded
+frame counts. `received=0` means libuvc delivered no complete frame callbacks;
+nonzero `received` with `encoded=0` means callbacks reached image processing but
+no usable frame was produced. Short frames remain rejected rather than silently
+discarding the advertised extra row.
+
+The first hardware test of `v0.3.0-focus3.1` reached capture startup but timed out
+without a usable frame. `v0.3.0-focus3.2` changes the commit/activation order and
+adds these diagnostics; successful streaming on Steam Frame still needs testing.
+If capture stalls, share the complete application output from this command:
+
+```sh
+sudo ./vft-stream --tracker focus3 2>focus3-capture.log
+cat focus3-capture.log
+```
+
+For deeper USB diagnostics, use `sudo LIBUSB_DEBUG=4 ./vft-stream --tracker focus3
+2>focus3-usb.log` and retain the whole log. Cancelled transfers at shutdown do not
+identify the original capture failure; the startup portion is also needed.
 
 ## Optional automatic service
 
@@ -137,8 +159,8 @@ in the cloud validation environment, so the standalone build was used and verifi
 Version tags beginning with `v` run `.github/workflows/release.yml`. The workflow
 builds native and static ARM64 binaries, runs the regression/sanitizer/integration
 checks, and publishes a hardware-test prerelease with the ARM64 executable,
-complete Steam Frame package and checksums. The first release is
-`v0.3.0-focus3.1`. The same workflow can be started manually with an existing
+complete Steam Frame package and checksums. The current release is
+`v0.3.0-focus3.2`. The same workflow can be started manually with an existing
 version tag if needed. Physical hardware validation remains required.
 
 ## Tests and validation status
@@ -153,7 +175,8 @@ sh tests/integration.sh
 Integration tests install Pillow 11.3.0 into the tools cache, simulate USB delivery,
 and exercise the real capture callback, JPEG encoder, HTTP server and cleanup.
 They verify decoded JPEG dimensions/pixels, reconnection, diagnostics without
-activation, device rejection, startup failures, busy ports and stalled capture.
+activation, device rejection, commit-before-activation ordering, startup failures,
+busy ports, delayed first frames, rejected frames and stalled capture.
 Protocol tests check exact payloads, padding, delays, acknowledgement behavior and
 shutdown after a failed write. Image tests cover all rotations, raw frames, padded
 stride, invalid buffers, area scaling and the reported odd-height mode. A fixture

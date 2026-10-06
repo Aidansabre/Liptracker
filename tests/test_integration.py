@@ -2,6 +2,7 @@
 import io
 import os
 from pathlib import Path
+import re
 import signal
 import socket
 import subprocess
@@ -18,10 +19,13 @@ class Integration(unittest.TestCase):
     def run_camera(self, mode="", options=()):
         log = Path(self.directory.name) / "usb.log"
         log.write_text("")
+        events = log.with_suffix(".events")
+        events.write_text("")
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
             port = sock.getsockname()[1]
-        environment = dict(os.environ, VFT_TEST_MODE=mode, VFT_TEST_LOG=str(log))
+        environment = dict(os.environ, VFT_TEST_MODE=mode, VFT_TEST_LOG=str(log),
+                           VFT_TEST_EVENTS=str(events))
         process = subprocess.Popen([binary, "-p", str(port), *options], env=environment,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.addCleanup(self.stop, process)
@@ -93,8 +97,13 @@ class Integration(unittest.TestCase):
         stdout, stderr = process.communicate(timeout=5)
         self.assertEqual(process.returncode, 0, stderr.decode())
         self.assertIn(b"640x481 YUYV @ 30 fps", stderr)
+        self.assertIn(b"max-frame=615680 max-payload=16384", stderr)
+        self.assertIn(b"first callback: 640x481", stderr)
         self.check_shutdown(log)
         self.assertEqual(len(log.read_text().splitlines()), 5)
+        self.assertEqual(log.with_suffix(".events").read_text().splitlines(),
+                         ["commit", "stream-off", "stream-on", "ir-on", "start",
+                          "stop", "ir-off", "stream-off", "close"])
 
     def test_raw_odd_height(self):
         process, port, log = self.run_camera(options=("-r",))
@@ -126,6 +135,44 @@ class Integration(unittest.TestCase):
                 process.communicate(timeout=5)
                 self.assertEqual(process.returncode, 1)
                 self.check_shutdown(log)
+                self.assertEqual(log.with_suffix(".events").read_text().splitlines()[-1], "close")
+
+    def test_commit_failure_does_not_activate(self):
+        process, _, log = self.run_camera("commit-failure")
+        _, stderr = process.communicate(timeout=5)
+        self.assertEqual(process.returncode, 1)
+        self.assertIn(b"commit capture stream", stderr)
+        self.assertEqual(log.read_text(), "")
+        self.assertEqual(log.with_suffix(".events").read_text().splitlines(), ["commit"])
+
+    def test_startup_callback_diagnostics(self):
+        for mode in ("no-callbacks", "rejected-frames"):
+            with self.subTest(mode=mode):
+                process, _, log = self.run_camera(mode, options=("--startup-timeout", "1"))
+                _, stderr = process.communicate(timeout=5)
+                self.assertEqual(process.returncode, 1)
+                self.assertIn(b"no usable startup frame in 1s", stderr)
+                counts = re.search(rb"received=(\d+) rejected=(\d+) encoded=(\d+)", stderr)
+                self.assertIsNotNone(counts)
+                received, rejected, encoded = map(int, counts.groups())
+                self.assertEqual(encoded, 0)
+                if mode == "no-callbacks":
+                    self.assertEqual((received, rejected), (0, 0))
+                    self.assertNotIn(b"first callback", stderr)
+                else:
+                    self.assertGreater(received, 0)
+                    self.assertEqual(rejected, received)
+                    self.assertIn(b"stride=1280 bytes=614400 expected=615680", stderr)
+                    self.assertEqual(stderr.count(b"rejected callback:"), 3)
+                self.check_shutdown(log)
+
+    def test_first_frame_can_take_longer_than_stall_deadline(self):
+        process, port, log = self.run_camera("delayed-start")
+        self.assertEqual(self.jpeg(process, port).size, (320, 480))
+        process.send_signal(signal.SIGTERM)
+        _, stderr = process.communicate(timeout=5)
+        self.assertEqual(process.returncode, 0, stderr.decode())
+        self.check_shutdown(log)
 
     def test_stall_cleanup(self):
         process, _, log = self.run_camera("stall")
