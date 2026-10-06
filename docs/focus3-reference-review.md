@@ -79,7 +79,8 @@ Steam Frame still need hardware validation.
 
 The `.4` default reader received 163840 bytes in ten seconds: five payloads,
 forty read timeouts and no full frames. Capture-before-activation received four
-32768-byte payloads before the stream-on write, then stalled. Two of those
+32768-byte payloads in total and then stalled. The first three were logged
+before stream-on; the old log does not establish the fourth payload's timing. Two of those
 payloads carried ERR, and the total image data was 131024 bytes. There is too
 little data to establish a complete frame at either 640x480 or 640x481.
 Changing frame-size acceptance or allowing UVC ERR cannot make that missing

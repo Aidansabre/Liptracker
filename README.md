@@ -104,7 +104,8 @@ not a complete image or an incorrect mode. `v0.3.0-focus3.4` uses direct bulk
 capture by default for Focus 3; successful streaming still needs hardware testing.
 The `.4` direct reader also stalled on hardware: the default run received only
 163840 bytes in ten seconds, and capture-before-activation received four
-payloads before stream-on and then stalled. Neither run delivered a full frame.
+payloads in total, with the first three logged before stream-on. The earlier
+log does not establish the fourth payload's timing. Neither run delivered a full frame.
 The `.5` diagnostics below test stream-commit ordering and USB timeout length;
 they are hypotheses to test rather than verified fixes.
 If capture stalls, share the complete application output from this command:

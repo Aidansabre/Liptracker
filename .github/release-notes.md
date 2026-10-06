@@ -2,7 +2,8 @@ Focus 3 stream-commit and USB-timeout diagnostics for Steam Frame.
 
 The .4 direct reader also stalled on physical hardware. The default run
 received 163840 bytes in ten seconds; capture-before-activation received four
-32768-byte payloads before stream-on and then stalled. Neither run delivered
+32768-byte payloads in total, with the first three logged before stream-on.
+The old log does not establish the fourth payload's timing. Neither run delivered
 one complete image. This is not enough data to establish whether the camera
 actually produces 640×480 or its advertised 640×481 frames.
 
