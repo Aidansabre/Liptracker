@@ -69,8 +69,7 @@ Options:
 --rotation 0|90|180|270  Focus 3 rotation in degrees CCW (default 90)
 --startup-timeout 1–120 first usable frame deadline in seconds (default 10)
 --capture-first        Focus 3: commit and queue USB capture before vendor activation
---capture-backend auto|bulk|libuvc|v4l2  default auto: Focus 3 bulk, VFT libuvc;
-                       v4l2: Focus 3 through the kernel uvcvideo driver
+--capture-backend auto|bulk|libuvc  default auto: Focus 3 bulk, VFT libuvc
 --allow-uvc-errors     inspect complete Focus 3 bulk frames carrying UVC ERR
 --recommit-after-activation  Focus 3 bulk: commit before and again after activation
 --bulk-timeout 50–5000 bulk read timeout in milliseconds (default 250)
@@ -95,15 +94,15 @@ ten-second deadline; after capture begins, three seconds without a usable frame
 triggers shutdown. Ctrl+C/SIGTERM, activation failure, stream-start failure and
 the watchdog attempt to turn IR off and disable streaming before releasing USB.
 
-## Capture experiments (`.7`)
+## Capture experiments (`.8`)
 
 The `.6` hardware run confirmed a high-speed link (480 Mbit/s, 512-byte packets)
 and accepted every vendor command, but received no image data at all after the
 commit. The earlier four-payload bursts were probably stale buffered data, so no
-run has yet made the sensor produce frames under libuvc/libusb. The tracker works
-on the Focus 3, which uses a Linux kernel, so `--capture-backend v4l2` uses the
-kernel `uvcvideo` driver instead: XU commands through `UVCIOC_CTRL_QUERY`, then
-`STREAMON`, which commits and keeps several bulk requests queued.
+run has yet made the sensor produce frames. The Steam Frame kernel has no
+`uvcvideo` driver, so capture stays in userspace. Focus 3 startup now mirrors one
+more step of that driver: SET_INTERFACE (alternate setting 0) on the streaming
+interface before the format probe. libuvc never sends it for bulk cameras.
 
 After unplugging/reconnecting the tracker once, run inside the package folder:
 
@@ -111,9 +110,9 @@ After unplugging/reconnecting the tracker once, run inside the package folder:
 sudo sh experiments.sh
 ```
 
-It writes `experiments.txt`. It records the kernel driver state, then runs six
-variants for up to 15 seconds each: uvcvideo, default, without the halt, libuvc,
-capture-first, capture-first without the halt. Between variants it re-enumerates
+It writes `experiments.txt`. It records the USB state, then runs five variants
+for up to 15 seconds each: default, without the halt, libuvc, capture-first and
+capture-first without the halt. Between variants it re-enumerates
 the tracker through sysfs. The whole run takes about two minutes. If a variant
 streams, its log shows `first callback` and frame rates.
 
@@ -280,7 +279,7 @@ Version tags beginning with `v` run `.github/workflows/release.yml`. The workflo
 builds native and static ARM64 binaries, runs the regression/sanitizer/integration
 checks, and publishes a hardware-test prerelease with the ARM64 executable,
 complete Steam Frame package and checksums. The current release is
-`v0.3.0-focus3.7`. The same workflow can be started manually with an existing
+`v0.3.0-focus3.8`. The same workflow can be started manually with an existing
 version tag if needed. Physical hardware validation remains required.
 
 ## Tests and validation status

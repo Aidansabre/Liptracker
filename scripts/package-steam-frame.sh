@@ -9,7 +9,7 @@ cp "$repo/dist/vft-stream-steam-frame" "$stage/vft-stream-focus3/vft-stream"
 cp "$repo/diag.sh" "$repo/experiments.sh" "$repo/install-service.sh" "$repo/README.md" "$repo/LICENSE" "$repo/THIRD_PARTY_NOTICES.md" "$stage/vft-stream-focus3/"
 cp -R "$repo/licenses" "$stage/vft-stream-focus3/"
 cp -R "$repo/docs" "$stage/vft-stream-focus3/"
-for item in vft-stream.c tracker.c tracker.h image.c image.h bulk_capture.c bulk_capture.h uvc_bulk.c uvc_bulk.h v4l2_capture.c v4l2_capture.h package.nix default.nix scripts tests docs; do
+for item in vft-stream.c tracker.c tracker.h image.c image.h bulk_capture.c bulk_capture.h uvc_bulk.c uvc_bulk.h package.nix default.nix scripts tests docs; do
   cp -R "$repo/$item" "$stage/vft-stream-focus3/source/"
 done
 cp "$repo/LICENSE" "$repo/THIRD_PARTY_NOTICES.md" "$repo/README.md" "$stage/vft-stream-focus3/source/"

@@ -59,8 +59,6 @@ uvc_error_t uvc_get_device_descriptor(uvc_device_t *dev, uvc_device_descriptor_t
   return UVC_SUCCESS;
 }
 void uvc_free_device_descriptor(uvc_device_descriptor_t *desc) { free(desc); }
-uint8_t uvc_get_bus_number(uvc_device_t *dev) { (void)dev; return 1; }
-uint8_t uvc_get_device_address(uvc_device_t *dev) { (void)dev; return 2; }
 uvc_error_t uvc_open(uvc_device_t *dev, uvc_device_handle_t **out) { (void)dev; *out = &handle; return UVC_SUCCESS; }
 void uvc_close(uvc_device_handle_t *dev) {
   assert(dev == &handle && !stream.open && !stream.started);
@@ -80,7 +78,8 @@ int libusb_get_active_config_descriptor(libusb_device *dev, struct libusb_config
   static struct libusb_interface interface;
   ep = (struct libusb_endpoint_descriptor){.bEndpointAddress = 0x81,
           .bmAttributes = mode("probe-invalid-endpoint") ? LIBUSB_TRANSFER_TYPE_INTERRUPT : LIBUSB_TRANSFER_TYPE_BULK};
-  alt = (struct libusb_interface_descriptor){.bInterfaceNumber = 1, .bNumEndpoints = 1, .endpoint = &ep};
+  alt = (struct libusb_interface_descriptor){.bInterfaceNumber = 1, .bNumEndpoints = 1, .endpoint = &ep,
+          .bInterfaceClass = LIBUSB_CLASS_VIDEO, .bInterfaceSubClass = 2};
   interface = (struct libusb_interface){.altsetting = &alt, .num_altsetting = 1};
   *out = calloc(1, sizeof **out); assert(*out);
   (*out)->bNumInterfaces = 1;
@@ -93,6 +92,14 @@ int libusb_get_device_speed(libusb_device *dev) {
 }
 int libusb_get_max_packet_size(libusb_device *dev, unsigned char endpoint) {
   assert(dev == &usb_device && endpoint == 0x81); return mode("full-speed") ? 64 : 512;
+}
+int libusb_claim_interface(libusb_device_handle *dev, int interface) {
+  assert(dev == &usb_handle && interface == 1); return LIBUSB_SUCCESS;
+}
+int libusb_set_interface_alt_setting(libusb_device_handle *dev, int interface, int alt) {
+  assert(dev == &usb_handle && interface == 1 && alt == 0 && !stream.open && !sensor_on);
+  event("set-interface");
+  return LIBUSB_SUCCESS;
 }
 int libusb_clear_halt(libusb_device_handle *dev, unsigned char endpoint) {
   assert(dev == &usb_handle && endpoint == 0x81 && !stream.started && !atomic_load(&running));

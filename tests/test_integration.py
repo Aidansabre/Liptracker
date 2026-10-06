@@ -103,7 +103,7 @@ class Integration(unittest.TestCase):
         self.check_shutdown(log)
         self.assertEqual(len(log.read_text().splitlines()), 5)
         self.assertEqual(log.with_suffix(".events").read_text().splitlines(),
-                         ["clear-halt", "stream-off", "stream-on", "ir-on", "commit", "start",
+                         ["set-interface", "clear-halt", "stream-off", "stream-on", "ir-on", "commit", "start",
                           "stop", "clear-halt", "ir-off", "stream-off", "close"])
         self.assertIn(b"USB link speed=high (480 Mbit/s) bulk endpoint=0x81 max-packet=512 needs=18.5 MB/s",
                       stderr)
@@ -151,7 +151,7 @@ class Integration(unittest.TestCase):
         self.assertIn(b"commit capture stream", stderr)
         self.check_shutdown(log)
         self.assertEqual(log.with_suffix(".events").read_text().splitlines(),
-                         ["clear-halt", "stream-off", "stream-on", "ir-on", "commit", "ir-off", "stream-off"])
+                         ["set-interface", "clear-halt", "stream-off", "stream-on", "ir-on", "commit", "ir-off", "stream-off"])
 
     def test_full_speed_link_warning(self):
         process, port, _ = self.run_camera("full-speed", options=("--startup-timeout", "1"))
@@ -204,7 +204,7 @@ class Integration(unittest.TestCase):
                 self.assertNotIn(b"first callback:", stderr)
                 self.check_shutdown(log)
                 self.assertEqual(log.with_suffix(".events").read_text().splitlines(),
-                                 ["clear-halt", "stream-off", "stream-on", "ir-on", "commit",
+                                 ["set-interface", "clear-halt", "stream-off", "stream-on", "ir-on", "commit",
                                   "bulk-read", "bulk-read", "bulk-read", "clear-halt",
                                   "ir-off", "stream-off", "close"])
 
@@ -218,6 +218,10 @@ class Integration(unittest.TestCase):
                 _, stderr = process.communicate(timeout=5)
                 self.assertEqual(process.returncode, 1, stderr.decode())
                 self.assertIn(message, stderr)
+                if mode == "probe-descriptor-failure":
+                    # Unreadable descriptors stop startup before activation.
+                    self.assertEqual(log.read_text(), "")
+                    continue
                 self.check_shutdown(log)
                 self.assertEqual(log.with_suffix(".events").read_text().splitlines()[-1], "close")
 
@@ -230,7 +234,7 @@ class Integration(unittest.TestCase):
         self.assertIn(b"USB capture queued before Focus 3 activation", stderr)
         self.check_shutdown(log)
         self.assertEqual(log.with_suffix(".events").read_text().splitlines(),
-                         ["clear-halt", "commit", "start", "stream-off", "stream-on", "ir-on",
+                         ["set-interface", "clear-halt", "commit", "start", "stream-off", "stream-on", "ir-on",
                           "stop", "clear-halt", "ir-off", "stream-off", "close"])
 
     def test_capture_first_failure_cleanup(self):
@@ -242,7 +246,7 @@ class Integration(unittest.TestCase):
                 events = log.with_suffix(".events").read_text().splitlines()
                 if mode == "start-failure":
                     self.assertEqual(log.read_text(), "")
-                    self.assertEqual(events, ["clear-halt", "commit", "start", "clear-halt", "close"])
+                    self.assertEqual(events, ["set-interface", "clear-halt", "commit", "start", "clear-halt", "close"])
                 else:
                     self.check_shutdown(log)
                     self.assertEqual(events[-5:], ["stop", "clear-halt", "ir-off", "stream-off", "close"])
@@ -305,7 +309,7 @@ class Integration(unittest.TestCase):
         process, _, log = self.run_camera("probe-descriptor-failure", backend=None)
         _, stderr = process.communicate(timeout=5)
         self.assertEqual(process.returncode, 1, stderr.decode())
-        self.assertIn(b"prepare bulk capture", stderr)
+        self.assertIn(b"bulk descriptors:", stderr)
         self.assertEqual(log.read_text(), "")
 
     def test_commit_follows_activation(self):
@@ -353,7 +357,7 @@ class Integration(unittest.TestCase):
                 self.assertIn(b"recommit after activation", stderr)
                 self.check_shutdown(log)
                 self.assertEqual(log.with_suffix(".events").read_text().splitlines(),
-                                 ["clear-halt", "commit", "stream-off", "stream-on", "ir-on", "recommit",
+                                 ["set-interface", "clear-halt", "commit", "stream-off", "stream-on", "ir-on", "recommit",
                                   "clear-halt", "ir-off", "stream-off", "close"])
 
     def test_bulk_timeout_and_transfer_trace(self):
@@ -375,24 +379,12 @@ class Integration(unittest.TestCase):
                  ("--bulk-timeout", "1000", "--probe-bulk"),
                  ("--recommit-after-activation", "--capture-backend", "libuvc"),
                  ("--recommit-after-activation", "--tracker", "vft"),
-                 ("--capture-backend", "v4l2", "--capture-first"),
-                 ("--capture-backend", "v4l2", "--diagnose"),
-                 ("--capture-backend", "v4l2", "--no-clear-halt"),
                  ("--no-clear-halt", "--tracker", "vft"))
         for options in cases:
             with self.subTest(options=options):
                 result = subprocess.run([binary, *options], capture_output=True, timeout=5)
                 self.assertEqual(result.returncode, 2, result.stderr.decode())
                 self.assertNotIn(b"SET_CUR", result.stderr)
-
-    def test_v4l2_without_kernel_node_does_not_activate(self):
-        # No uvcvideo node in the test environment: fail before any XU write.
-        process, _, log = self.run_camera(backend="v4l2")
-        _, stderr = process.communicate(timeout=5)
-        self.assertEqual(process.returncode, 1, stderr.decode())
-        self.assertIn(b"no uvcvideo capture node for USB 001:002", stderr)
-        self.assertEqual(log.read_text(), "")
-        self.assertEqual(log.with_suffix(".events").read_text(), "")
 
     def test_no_clear_halt(self):
         process, port, log = self.run_camera(backend=None, options=("--no-clear-halt",))

@@ -25,17 +25,13 @@ drivers() {
     [ -d "$interface" ] || continue
     printf '  %s driver=%s\n' "${interface##*/}" "$(basename "$(readlink "$interface/driver" 2>/dev/null)" 2>/dev/null)"
   done
-  for node in /sys/class/video4linux/video*; do
-    [ -e "$node" ] && printf '  %s -> %s (%s)\n' "${node##*/}" "$(readlink -f "$node/device")" "$(cat "$node/name" 2>/dev/null)"
-  done
 }
 
 reenumerate() {
   device=$(tracker) || { echo 'tracker not found; reconnect it'; return 1; }
   echo 0 > "$device/authorized" && sleep 2 && echo 1 > "$device/authorized"
-  # uvcvideo needs a moment to bind and create /dev/video* again.
   for _ in 1 2 3 4 5 6 7 8 9 10; do
-    tracker >/dev/null && ls /dev/video* >/dev/null 2>&1 && break
+    tracker >/dev/null && break
     sleep 1
   done
   sleep 2
@@ -54,26 +50,14 @@ variant() {
   printf '== system ==\n'
   uname -a
   date
-  printf '\n== uvcvideo module ==\n'
-  if [ -d /sys/module/uvcvideo ]; then
-    echo 'uvcvideo loaded'
-    for parameter in /sys/module/uvcvideo/parameters/*; do
-      [ -r "$parameter" ] && printf '  %s=%s\n' "${parameter##*/}" "$(cat "$parameter")"
-    done
-  else
-    echo 'uvcvideo not loaded; trying modprobe'
-    modprobe uvcvideo 2>&1 && echo 'modprobe uvcvideo: ok'
-  fi
   printf '\n== tracker before experiments ==\n'
   drivers
-  # Kernel driver first: it is the stack the Focus 3 headset itself uses.
-  variant A-uvcvideo --capture-backend v4l2
-  variant B-default
-  variant C-no-clear-halt --no-clear-halt
-  variant D-libuvc --capture-backend libuvc
-  variant E-capture-first --capture-first
-  variant F-capture-first-no-halt --capture-first --no-clear-halt
+  variant A-default
+  variant B-no-clear-halt --no-clear-halt
+  variant C-libuvc --capture-backend libuvc
+  variant D-capture-first --capture-first
+  variant E-capture-first-no-halt --capture-first --no-clear-halt
   printf '\n== kernel messages ==\n'
-  dmesg 2>/dev/null | grep -iE 'uvc|usb [0-9-]+.*(0bb4|htc|lip|reset|disconnect|new high)' | tail -n 80
+  dmesg 2>/dev/null | grep -iE 'usb [0-9-]+.*(0bb4|htc|lip|reset|disconnect|new high|over-current|power)' | tail -n 80
 } > "$report" 2>&1
 printf 'Wrote %s\n' "$report"

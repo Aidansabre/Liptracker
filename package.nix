@@ -20,7 +20,7 @@ stdenv.mkDerivation {
   # asking pkg-config.
   buildPhase = ''
     runHook preBuild
-    $CC -O2 -Wall -Wextra -o vft-stream vft-stream.c tracker.c image.c bulk_capture.c uvc_bulk.c v4l2_capture.c \
+    $CC -O2 -Wall -Wextra -o vft-stream vft-stream.c tracker.c image.c bulk_capture.c uvc_bulk.c \
       -I${stb}/include/stb -I${lib.getDev libuvc}/include -I${lib.getDev libusb1}/include/libusb-1.0 \
       -L${lib.getLib libuvc}/lib -L${lib.getLib libusb1}/lib \
       -luvc -lusb-1.0 -lm -lpthread

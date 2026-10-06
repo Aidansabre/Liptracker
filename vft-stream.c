@@ -51,7 +51,6 @@
 #include "tracker.h"
 #include "image.h"
 #include "bulk_capture.h"
-#include "v4l2_capture.h"
 
 static volatile sig_atomic_t stop;
 static void on_signal(int s) { (void)s; stop = 1; }
@@ -396,8 +395,7 @@ static void usage(int status) {
           "  --startup-timeout 1-120   first usable frame deadline (default 10s)\n"
           "  --probe-bulk              Focus 3 raw USB transfer diagnostic, then exit\n"
           "  --capture-first           Focus 3: commit and queue capture before vendor activation\n"
-          "  --capture-backend auto|bulk|libuvc|v4l2  Focus 3 defaults to direct bulk reads;\n"
-          "                            v4l2 uses the kernel uvcvideo driver\n"
+          "  --capture-backend auto|bulk|libuvc  Focus 3 defaults to direct bulk reads\n"
           "  --allow-uvc-errors        inspect full Focus 3 frames carrying UVC ERR\n"
           "  --recommit-after-activation  Focus 3 bulk: commit before and again after activation\n"
           "  --bulk-timeout 50-5000    bulk read timeout in ms (default 250)\n"
@@ -429,34 +427,6 @@ static int watch_frames(int startup_timeout) {
     }
   }
   return 0;
-}
-
-/* Focus 3 through the kernel uvcvideo driver, without libuvc claiming the
- * device: XU activation, then STREAMON (commit and queued bulk reads). */
-static int stream_v4l2(unsigned bus, unsigned address, int xu_unit, int server_fd, int startup_timeout) {
-  struct v4l2_capture *capture = NULL;
-  if (v4l2_capture_open(bus, address, xu_unit, &capture)) return 1;
-  struct tracker_io io = {.context = capture, .length = v4l2_capture_xu_length(capture),
-                          .send = v4l2_capture_send, .sleep_ms = control_sleep};
-  int rc = 1;
-  if (tracker_set_state(TRACKER_FOCUS3, 1, &io)) goto done;
-  pthread_t srv;
-  if ((rc = pthread_create(&srv, NULL, server, (void *)(intptr_t)server_fd))) {
-    fprintf(stderr, "vft-stream: create HTTP server: %s\n", strerror(rc));
-    rc = 1;
-    goto done;
-  }
-  pthread_detach(srv);
-  clock_gettime(CLOCK_MONOTONIC, &last_frame);
-  rc = v4l2_capture_start(capture, on_frame, NULL) ? 1 : watch_frames(startup_timeout);
-done:
-  v4l2_capture_stop(capture);
-  if (tracker_set_state(TRACKER_FOCUS3, 0, &io)) {
-    fprintf(stderr, "vft-stream: tracker shutdown failed (device may be disconnected)\n");
-    rc = 1;
-  }
-  v4l2_capture_close(capture);
-  return rc;
 }
 
 /* VS_COMMIT. Focus 3 commits after vendor activation by default, as the
@@ -520,7 +490,6 @@ int main(int argc, char **argv) {
         if (!strcmp(optarg, "auto")) backend = 0;
         else if (!strcmp(optarg, "bulk")) backend = 1;
         else if (!strcmp(optarg, "libuvc")) backend = 2;
-        else if (!strcmp(optarg, "v4l2")) backend = 3;
         else usage(2);
         break;
       case 'E': allow_uvc_errors = 1; break;
@@ -537,11 +506,7 @@ int main(int argc, char **argv) {
   if (allow_uvc_errors && (diagnose || bulk_diagnostic || backend == 2 || requested == TRACKER_VFT)) usage(2);
   if ((recommit || custom_bulk_timeout) &&
       (diagnose || bulk_diagnostic || backend == 2 || requested == TRACKER_VFT)) usage(2);
-  if (!clear_halt && (diagnose || requested == TRACKER_VFT || backend == 3)) usage(2);
-  /* The kernel driver path keeps uvcvideo bound and supports none of the
-   * libusb transfer diagnostics. */
-  if (backend == 3 && (diagnose || bulk_diagnostic || capture_first || allow_uvc_errors ||
-                       recommit || custom_bulk_timeout || requested == TRACKER_VFT)) usage(2);
+  if (!clear_halt && (diagnose || requested == TRACKER_VFT)) usage(2);
 
   struct sigaction sa = {.sa_handler = on_signal};
   sigaction(SIGINT, &sa, NULL);
@@ -586,19 +551,9 @@ int main(int argc, char **argv) {
     fprintf(stderr, "vft-stream: %d matching cameras; use --tracker and --pid to select exactly one\n", matches);
     goto cleanup;
   }
-  if ((bulk_diagnostic || capture_first || backend == 1 || backend == 3 || allow_uvc_errors || recommit ||
+  if ((bulk_diagnostic || capture_first || backend == 1 || allow_uvc_errors || recommit ||
        custom_bulk_timeout || !clear_halt) && profile != TRACKER_FOCUS3) {
     fprintf(stderr, "vft-stream: capture diagnostics require a Focus 3 tracker\n");
-    goto cleanup;
-  }
-  if (backend == 3) {
-    /* uvc_open would detach uvcvideo; only enumeration used libuvc. */
-    server_fd = open_server(port);
-    if (server_fd < 0) {
-      fprintf(stderr, "vft-stream: HTTP listen: %s\n", strerror(errno));
-      goto cleanup;
-    }
-    rc = stream_v4l2(uvc_get_bus_number(dev), uvc_get_device_address(dev), xu_unit, server_fd, startup_timeout);
     goto cleanup;
   }
   if ((r = uvc_open(dev, &h)) < 0) {
@@ -615,6 +570,7 @@ int main(int argc, char **argv) {
   io.length = r;
   int use_bulk = profile == TRACKER_FOCUS3 && backend != 2 && !bulk_diagnostic;
   usb.trace = bulk_diagnostic || capture_first || use_bulk;
+  if (profile == TRACKER_FOCUS3 && bulk_select_alt0(h)) goto cleanup;
 
   uvc_stream_ctrl_t ctrl = {0};
   unsigned width = 0, height = 0;

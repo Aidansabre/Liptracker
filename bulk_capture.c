@@ -65,6 +65,29 @@ static const char *speed_name(int speed) {
     default: return speed > LIBUSB_SPEED_SUPER ? "super+" : "unknown";
   }
 }
+/* Linux uvcvideo selects alternate setting 0 on each streaming interface
+ * before any video request; some cameras misbehave without it. libuvc never
+ * sends SET_INTERFACE for a bulk-only interface. */
+int bulk_select_alt0(uvc_device_handle_t *h) {
+  libusb_device_handle *usb = uvc_get_libusb_handle(h);
+  struct libusb_config_descriptor *config = NULL;
+  int r = libusb_get_active_config_descriptor(libusb_get_device(usb), &config);
+  if (r < 0) {
+    fprintf(stderr, "vft-stream: bulk descriptors: %s\n", libusb_error_name(r));
+    return r;
+  }
+  int failed = 0;
+  for (int i = 0; i < config->bNumInterfaces && !failed; i++) {
+    const struct libusb_interface_descriptor *alt = &config->interface[i].altsetting[0];
+    if (alt->bInterfaceClass != LIBUSB_CLASS_VIDEO || alt->bInterfaceSubClass != 2) continue;
+    int n = alt->bInterfaceNumber;
+    if ((r = libusb_claim_interface(usb, n)) || (r = libusb_set_interface_alt_setting(usb, n, 0)))
+      failed = 1;
+    fprintf(stderr, "vft-stream: SET_INTERFACE streaming interface=%d alt=0: %s\n", n, libusb_error_name(r));
+  }
+  libusb_free_config_descriptor(config);
+  return failed ? r : 0;
+}
 /* 640x481 YUY2 at 30 FPS needs about 18.5 MB/s, which only high speed or
  * faster can carry. A slower link overruns the camera's buffers (UVC ERR). */
 void bulk_report_link(uvc_device_handle_t *h, const uvc_stream_ctrl_t *ctrl, uint8_t endpoint) {
