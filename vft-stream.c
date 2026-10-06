@@ -83,9 +83,11 @@ static int control_send(void *context, const uint8_t *command, size_t length, in
     return r < 0 ? r : UVC_ERROR_IO;
   }
   if (usb->trace) {
+    flockfile(stderr);
     fprintf(stderr, "vft-stream: XU %u SET_CUR sent %d bytes prefix=", usb->unit, r);
     for (size_t i = 0; i < length && i < 17; i++) fprintf(stderr, "%02x", command[i]);
     fputc('\n', stderr);
+    funlockfile(stderr);
   }
   if (!ack) return 0;
   uint8_t response[TRACKER_MAX_CONTROL];
@@ -384,6 +386,8 @@ static void usage(int status) {
           "  --capture-first           Focus 3: queue capture before vendor activation\n"
           "  --capture-backend auto|bulk|libuvc  Focus 3 defaults to direct bulk reads\n"
           "  --allow-uvc-errors        inspect full Focus 3 frames carrying UVC ERR\n"
+          "  --recommit-after-activation  Focus 3 bulk: reapply UVC mode after activation\n"
+          "  --bulk-timeout 50-5000    bulk read timeout in ms (default 250)\n"
           "  --diagnose               print USB/UVC descriptors without activation\n");
   exit(status);
 }
@@ -400,6 +404,8 @@ int main(int argc, char **argv) {
   int port = 8085, opt, r, pid = 0, xu_unit = 0, diagnose = 0, startup_timeout = 10;
   int bulk_diagnostic = 0, capture_first = 0;
   int backend = 0, allow_uvc_errors = 0;
+  int recommit = 0, bulk_timeout = 250, custom_bulk_timeout = 0;
+  enum { OPT_RECOMMIT = 1000, OPT_BULK_TIMEOUT };
   enum tracker_profile requested = TRACKER_AUTO;
   static const struct option options[] = {
     {"tracker", required_argument, NULL, 't'}, {"pid", required_argument, NULL, 'i'},
@@ -409,6 +415,8 @@ int main(int argc, char **argv) {
     {"capture-first", no_argument, NULL, 'C'},
     {"capture-backend", required_argument, NULL, 'K'},
     {"allow-uvc-errors", no_argument, NULL, 'E'},
+    {"recommit-after-activation", no_argument, NULL, OPT_RECOMMIT},
+    {"bulk-timeout", required_argument, NULL, OPT_BULK_TIMEOUT},
     {"diagnose", no_argument, NULL, 'd'}, {"help", no_argument, NULL, 'h'}, {NULL, 0, NULL, 0}
   };
   while ((opt = getopt_long(argc, argv, "p:q:rh", options, NULL)) != -1) switch (opt) {
@@ -434,6 +442,8 @@ int main(int argc, char **argv) {
         else usage(2);
         break;
       case 'E': allow_uvc_errors = 1; break;
+      case OPT_RECOMMIT: recommit = 1; break;
+      case OPT_BULK_TIMEOUT: bulk_timeout = parse_number(optarg, 10, 50, 5000); custom_bulk_timeout = 1; break;
       case 'd': diagnose = 1; break;
       case 'h': usage(0); break;
       default: usage(2);
@@ -442,6 +452,8 @@ int main(int argc, char **argv) {
   if ((bulk_diagnostic || capture_first) && (diagnose || requested == TRACKER_VFT)) usage(2);
   if (bulk_diagnostic && capture_first) usage(2);
   if (allow_uvc_errors && (diagnose || bulk_diagnostic || backend == 2 || requested == TRACKER_VFT)) usage(2);
+  if ((recommit || custom_bulk_timeout) &&
+      (diagnose || bulk_diagnostic || backend == 2 || requested == TRACKER_VFT)) usage(2);
 
   struct sigaction sa = {.sa_handler = on_signal};
   sigaction(SIGINT, &sa, NULL);
@@ -485,7 +497,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "vft-stream: %d matching cameras; use --tracker and --pid to select exactly one\n", matches);
     goto cleanup;
   }
-  if ((bulk_diagnostic || capture_first || backend == 1 || allow_uvc_errors) && profile != TRACKER_FOCUS3) {
+  if ((bulk_diagnostic || capture_first || backend == 1 || allow_uvc_errors || recommit || custom_bulk_timeout) && profile != TRACKER_FOCUS3) {
     fprintf(stderr, "vft-stream: capture diagnostics require a Focus 3 tracker\n");
     goto cleanup;
   }
@@ -527,7 +539,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "vft-stream: UVC stream committed before Focus 3 activation\n");
   }
   if (use_bulk) {
-    if ((r = bulk_capture_open(h, &ctrl, width, height, allow_uvc_errors, &bulk)) < 0) {
+    if ((r = bulk_capture_open(h, &ctrl, width, height, allow_uvc_errors, bulk_timeout, &bulk)) < 0) {
       fprintf(stderr, "vft-stream: prepare bulk capture: %s\n", uvc_strerror(r));
       goto cleanup;
     }
@@ -546,6 +558,13 @@ int main(int argc, char **argv) {
   }
   activation_attempted = 1;
   if (tracker_set_state(profile, 1, &io)) goto cleanup;
+  if (recommit) {
+    if ((r = uvc_stream_ctrl(capture, &ctrl)) < 0) {
+      fprintf(stderr, "vft-stream: recommit after activation: %s\n", uvc_strerror(r));
+      goto cleanup;
+    }
+    fprintf(stderr, "vft-stream: UVC stream recommitted after Focus 3 activation\n");
+  }
   if (bulk_diagnostic) {
     rc = probe_bulk(h, &ctrl, startup_timeout);
     goto cleanup;

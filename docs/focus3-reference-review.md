@@ -74,3 +74,26 @@ libuvc backend remains available for comparison.
 Protocol/image/decoder and simulated USB/HTTP tests validate the implementation.
 Physical streaming, error rates, image size, orientation and performance on
 Steam Frame still need hardware validation.
+
+## Direct-reader hardware results and next tests
+
+The `.4` default reader received 163840 bytes in ten seconds: five payloads,
+forty read timeouts and no full frames. Capture-before-activation received four
+32768-byte payloads before the stream-on write, then stalled. Two of those
+payloads carried ERR, and the total image data was 131024 bytes. There is too
+little data to establish a complete frame at either 640x480 or 640x481.
+Changing frame-size acceptance or allowing UVC ERR cannot make that missing
+image data appear.
+
+The `.5` diagnostic `--recommit-after-activation` repeats the negotiated UVC
+commit after all three vendor activation writes/delays. This tests whether
+activation clears an earlier streaming configuration. It uses libuvc's public
+`uvc_stream_ctrl` API on the already-open stream without starting libuvc capture.
+`--bulk-timeout 1000` separately tests fewer USB timeout cancellations than
+the default 250 ms. Both hypotheses remain unverified on hardware. Their
+simulated tests cover successful image delivery, failure cleanup and retained
+partial timeout data.
+
+Logs include the first twelve payload prefixes and read statuses/timestamps,
+including data received with timeouts. This provides visibility into later
+headers and frame boundaries that the earlier three-prefix log omitted.

@@ -71,6 +71,8 @@ Options:
 --capture-first        Focus 3: queue USB capture before vendor activation
 --capture-backend auto|bulk|libuvc  default auto: Focus 3 bulk, VFT libuvc
 --allow-uvc-errors     inspect complete Focus 3 bulk frames carrying UVC ERR
+--recommit-after-activation  Focus 3 bulk: reapply UVC mode after activation
+--bulk-timeout 50–5000 bulk read timeout in milliseconds (default 250)
 --probe-bulk           Focus 3: read raw USB transfers for diagnosis, then exit
 --diagnose              inspect descriptors without activating the tracker
 ```
@@ -100,12 +102,39 @@ received three 32768-byte payloads, while libuvc delivered a 131024-byte partial
 frame. One observed payload carried UVC ERR. This establishes USB byte delivery,
 not a complete image or an incorrect mode. `v0.3.0-focus3.4` uses direct bulk
 capture by default for Focus 3; successful streaming still needs hardware testing.
+The `.4` direct reader also stalled on hardware: the default run received only
+163840 bytes in ten seconds, and capture-before-activation received four
+payloads before stream-on and then stalled. Neither run delivered a full frame.
+The `.5` diagnostics below test stream-commit ordering and USB timeout length;
+they are hypotheses to test rather than verified fixes.
 If capture stalls, share the complete application output from this command:
 
 ```sh
 sudo ./vft-stream --tracker focus3 2>focus3-capture.log
 cat focus3-capture.log
 ```
+
+To check whether vendor activation clears the UVC streaming configuration,
+reapply the same negotiated commit after activation:
+
+```sh
+sudo ./vft-stream --tracker focus3 --recommit-after-activation 2>focus3-recommit.log
+cat focus3-recommit.log
+```
+
+Then separately test a one-second read timeout to reduce USB transfer
+cancellations:
+
+```sh
+sudo ./vft-stream --tracker focus3 --bulk-timeout 1000 2>focus3-timeout.log
+cat focus3-timeout.log
+```
+
+Unplug/reconnect the tracker before each comparison and stop other camera
+processes. Keep the complete logs. The reader reports statuses, pending partial
+data, timestamps and the first twelve payload prefixes. The UVC commit option
+and custom timeout apply only to Focus 3 direct capture. Shutdown can wait up to
+the selected read timeout for an outstanding USB request to finish.
 
 Try the alternative activation timing, which queues USB reads before sending the
 same sensor/IR commands. The default order is
@@ -218,7 +247,7 @@ Version tags beginning with `v` run `.github/workflows/release.yml`. The workflo
 builds native and static ARM64 binaries, runs the regression/sanitizer/integration
 checks, and publishes a hardware-test prerelease with the ARM64 executable,
 complete Steam Frame package and checksums. The current release is
-`v0.3.0-focus3.4`. The same workflow can be started manually with an existing
+`v0.3.0-focus3.5`. The same workflow can be started manually with an existing
 version tag if needed. Physical hardware validation remains required.
 
 ## Tests and validation status

@@ -5,7 +5,7 @@
 struct bulk_capture;
 int bulk_endpoint(uvc_device_handle_t *, const uvc_stream_ctrl_t *, uint8_t *);
 int bulk_capture_open(uvc_device_handle_t *, const uvc_stream_ctrl_t *,
-                      unsigned, unsigned, int, struct bulk_capture **);
+                      unsigned, unsigned, int, unsigned, struct bulk_capture **);
 int bulk_capture_start(struct bulk_capture *, uvc_frame_callback_t *, void *);
 void bulk_capture_stop(struct bulk_capture *);
 void bulk_capture_close(struct bulk_capture *);

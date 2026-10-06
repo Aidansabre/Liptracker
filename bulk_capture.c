@@ -14,7 +14,7 @@ struct bulk_capture {
   libusb_device_handle *usb;
   uint8_t endpoint, *payload;
   size_t length;
-  unsigned width, height;
+  unsigned width, height, timeout;
   struct uvc_bulk_decoder decoder;
   uvc_frame_callback_t *callback;
   void *user;
@@ -67,18 +67,20 @@ static void observe(void *user, size_t size, int bad, int incomplete) {
             size, b->decoder.capacity, bad, incomplete);
 }
 int bulk_capture_open(uvc_device_handle_t *h, const uvc_stream_ctrl_t *ctrl,
-                      unsigned width, unsigned height, int allow_errors, struct bulk_capture **out) {
+                      unsigned width, unsigned height, int allow_errors, unsigned timeout, struct bulk_capture **out) {
   *out = NULL;
   uint8_t endpoint = 0;
   int r = bulk_endpoint(h, ctrl, &endpoint);
   if (r) return r;
-  if (!width || !height || (width & 1) || width > 1920 || height > 1080) return UVC_ERROR_INVALID_MODE;
+  if (!width || !height || (width & 1) || width > 1920 || height > 1080 || timeout < 50 || timeout > 5000)
+    return UVC_ERROR_INVALID_MODE;
   struct bulk_capture *b = calloc(1, sizeof *b);
   if (!b) return UVC_ERROR_NO_MEM;
   b->usb = uvc_get_libusb_handle(h);
   b->endpoint = endpoint;
   b->length = ctrl->dwMaxPayloadTransferSize;
   b->width = width; b->height = height;
+  b->timeout = timeout;
   atomic_init(&b->running, 0);
   b->payload = malloc(b->length);
   if (!b->payload || uvc_bulk_init(&b->decoder, (size_t)width * height * 2, allow_errors, ready, b)) {
@@ -91,18 +93,33 @@ int bulk_capture_open(uvc_device_handle_t *h, const uvc_stream_ctrl_t *ctrl,
 static void *read_loop(void *user) {
   struct bulk_capture *b = user;
   size_t used = 0;
+  struct timespec begin, now;
+  clock_gettime(CLOCK_MONOTONIC, &begin);
+  unsigned timeout_logs = 0;
   while (atomic_load(&b->running)) {
     int got = 0;
     int requested = b->length - used;
-    int r = libusb_bulk_transfer(b->usb, b->endpoint, b->payload + used, requested, &got, 250);
+    int r = libusb_bulk_transfer(b->usb, b->endpoint, b->payload + used, requested, &got, b->timeout);
     b->reads++;
     if (r == LIBUSB_ERROR_TIMEOUT) b->timeouts++;
     if (got < 0 || got > requested) { uvc_bulk_discard(&b->decoder); break; }
     b->bytes += got;
     used += got;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    double elapsed = now.tv_sec - begin.tv_sec + (now.tv_nsec - begin.tv_nsec) / 1e9;
+    if (b->decoder.stats.payloads < 12 && (got || b->reads == 1 ||
+        (r == LIBUSB_ERROR_TIMEOUT && timeout_logs++ < 4)))
+      fprintf(stderr, "vft-stream: bulk read: t=%.3fs read=%" PRIu64 " status=%s (%d) requested=%d bytes=%d pending=%zu\n",
+              elapsed, b->reads, libusb_error_name(r), r, requested, got, used);
     if (!r || (r == LIBUSB_ERROR_TIMEOUT && used == b->length)) {
-      if (b->decoder.stats.payloads < 3 && used >= 2)
-        fprintf(stderr, "vft-stream: bulk payload: bytes=%zu header=%u flags=0x%02x\n", used, b->payload[0], b->payload[1]);
+      if (b->decoder.stats.payloads < 12 && used >= 2) {
+        flockfile(stderr);
+        fprintf(stderr, "vft-stream: bulk payload: t=%.3fs bytes=%zu header=%u flags=0x%02x prefix=",
+                elapsed, used, b->payload[0], b->payload[1]);
+        for (size_t i = 0; i < used && i < 24; i++) fprintf(stderr, "%02x", b->payload[i]);
+        fputc('\n', stderr);
+        funlockfile(stderr);
+      }
       uvc_bulk_feed(&b->decoder, b->payload, used);
       used = 0;
     } else if (r != LIBUSB_ERROR_TIMEOUT) {
@@ -125,7 +142,8 @@ int bulk_capture_start(struct bulk_capture *b, uvc_frame_callback_t *callback, v
   int r = pthread_create(&b->thread, NULL, read_loop, b);
   if (r) { atomic_store(&b->running, 0); return UVC_ERROR_OTHER; }
   b->started = 1;
-  fprintf(stderr, "vft-stream: direct bulk capture endpoint=0x%02x payload=%zu\n", b->endpoint, b->length);
+  fprintf(stderr, "vft-stream: direct bulk capture endpoint=0x%02x payload=%zu timeout=%ums\n",
+          b->endpoint, b->length, b->timeout);
   return 0;
 }
 void bulk_capture_stop(struct bulk_capture *b) {

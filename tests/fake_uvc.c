@@ -26,6 +26,8 @@ static atomic_int sensor_on, ir_on;
 static atomic_int running;
 static atomic_int bulk_read_started;
 static pthread_t thread;
+static pthread_t main_thread;
+static atomic_int recommitted;
 static uvc_frame_callback_t *callback;
 static void *callback_context;
 static int mode(const char *name) {
@@ -39,7 +41,7 @@ static void event(const char *name) {
   if (log) { fprintf(log, "%s\n", name); fclose(log); }
 }
 uvc_error_t uvc_init(uvc_context_t **ctx, struct libusb_context *usb) {
-  (void)usb; *ctx = &context; return UVC_SUCCESS;
+  (void)usb; main_thread = pthread_self(); *ctx = &context; return UVC_SUCCESS;
 }
 void uvc_exit(uvc_context_t *ctx) { assert(ctx == &context); }
 uvc_error_t uvc_get_device_list(uvc_context_t *ctx, uvc_device_t ***list) {
@@ -99,7 +101,8 @@ static int capture_transfer(unsigned char *data, int length, int *got, unsigned 
   *got = 0;
   for (unsigned waited = 0; (!sensor_on || !ir_on) && waited < timeout; waited += 5) usleep(5000);
   if (!sensor_on || !ir_on) return LIBUSB_ERROR_TIMEOUT;
-  if (mode("bulk-empty") || (mode("bulk-stall") && frame_number)) {
+  if (mode("bulk-empty") || (mode("bulk-stall") && frame_number) ||
+      (mode("bulk-recommit-required") && !recommitted)) {
     usleep(timeout * 1000); return LIBUSB_ERROR_TIMEOUT;
   }
   if (mode("bulk-read-error")) return LIBUSB_ERROR_IO;
@@ -130,9 +133,9 @@ static int capture_transfer(unsigned char *data, int length, int *got, unsigned 
 }
 int libusb_bulk_transfer(libusb_device_handle *dev, unsigned char endpoint,
                         unsigned char *data, int length, int *got, unsigned int timeout) {
-  assert(dev == &usb_handle && endpoint == 0x81 && length > 0 && length <= 16384 && timeout && timeout <= 1000);
+  assert(dev == &usb_handle && endpoint == 0x81 && length > 0 && length <= 16384 && timeout && timeout <= 5000);
   assert(stream.open && !stream.started);
-  if (timeout == 250) return capture_transfer(data, length, got, timeout);
+  if (!pthread_equal(pthread_self(), main_thread)) return capture_transfer(data, length, got, timeout);
   assert(sensor_on && ir_on);
   event("bulk-read");
   *got = 0;
@@ -220,6 +223,14 @@ uvc_error_t uvc_stream_open_ctrl(uvc_device_handle_t *dev, uvc_stream_handle_t *
   sensor_on = ir_on = 0;
   stream.open = 1;
   *out = &stream;
+  return UVC_SUCCESS;
+}
+uvc_error_t uvc_stream_ctrl(uvc_stream_handle_t *capture, uvc_stream_ctrl_t *ctrl) {
+  assert(capture == &stream && stream.open && !stream.started && ctrl->bInterfaceNumber == 1);
+  assert(sensor_on && ir_on);
+  event("recommit");
+  if (mode("recommit-failure")) return UVC_ERROR_IO;
+  atomic_store(&recommitted, 1);
   return UVC_SUCCESS;
 }
 uvc_error_t uvc_stream_start(uvc_stream_handle_t *capture, uvc_frame_callback_t *cb,

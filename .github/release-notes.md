@@ -1,46 +1,53 @@
-Focus 3 direct bulk capture for Steam Frame.
+Focus 3 stream-commit and USB-timeout diagnostics for Steam Frame.
 
-The earlier libuvc capture stalled, but the direct USB probe received camera
-payloads. This release uses direct bulk reads and UVC frame assembly by default
-for Focus 3. It retains partial data returned with timeouts, recovers after
-incomplete/error frames, and reports frame sizes and UVC error counts. The
-original VFT capture path is preserved.
+The .4 direct reader also stalled on physical hardware. The default run
+received 163840 bytes in ten seconds; capture-before-activation received four
+32768-byte payloads before stream-on and then stalled. Neither run delivered
+one complete image. This is not enough data to establish whether the camera
+actually produces 640×480 or its advertised 640×481 frames.
 
-A thorough review of Kirisame-Nanoha/Lip_Camera_IP_Server confirmed that our
-five activation/shutdown commands, padding and delays match exactly. Their
-camera code selects the reported YUY2 format; 320×480 is resized network output.
-We retain the tracker's advertised 640×481 at approximately 30 FPS. The review
-is included in `docs/focus3-reference-review.md`.
+This release adds controlled comparisons:
+
+- `--recommit-after-activation` reapplies the same negotiated UVC streaming
+  commit after the vendor activation commands, testing whether activation
+  clears the earlier stream configuration.
+- `--bulk-timeout 1000` changes the bulk read timeout from 250 ms to one second,
+  testing whether repeated timeout cancellations contribute to the stall.
+- Initial transfer logs now include statuses, timestamps, pending partial
+  bytes and the first twelve payload prefixes.
+
+These are diagnostic hypotheses, not verified hardware fixes. The original
+VFT capture path and the Focus 3 activation bytes are preserved.
 
 Download `vft-stream-focus3-steam-frame.tar.gz` for the static ARM64 executable,
-helper scripts, complete application source and licenses. `SHA256SUMS` verifies
-the package and standalone executable. Stop other camera processes, then run:
+source, helper scripts, reference review and license notices. Stop other camera
+processes and unplug/reconnect the tracker before each comparison.
+
+First run:
 
 ```sh
-tar -xzf vft-stream-focus3-steam-frame.tar.gz
-cd vft-stream-focus3
-sudo ./vft-stream --tracker focus3 2>focus3-capture.log
-cat focus3-capture.log
+sudo ./vft-stream --tracker focus3 --recommit-after-activation 2>focus3-recommit.log
+cat focus3-recommit.log
 ```
 
-Connect to `http://<Steam-Frame-IP>:8085/` for MJPEG output. If capture fails,
-share the complete log, including `bulk frame` and `bulk totals` lines. A full
-640×481 YUY2 image is 615680 bytes; a 640×480 image would be 614400 bytes.
-Incomplete and error-marked frames are rejected by default.
+Then unplug/reconnect and run the timeout comparison separately:
 
-Useful comparison options:
+```sh
+sudo ./vft-stream --tracker focus3 --bulk-timeout 1000 2>focus3-timeout.log
+cat focus3-timeout.log
+```
 
-- `--capture-first`: queue capture before the existing activation commands.
-- `--capture-backend libuvc`: use the earlier capture implementation.
-- `--allow-uvc-errors -r`: inspect full-size UVC ERR frames without processing;
-  incomplete frames remain rejected.
-- `--probe-bulk --startup-timeout 5`: inspect raw transfers without MJPEG.
+Share both complete logs if streaming stalls. If it starts, connect to
+`http://<Steam-Frame-IP>:8085/` and confirm image visibility/orientation.
+Ctrl+C stops capture and attempts normal IR/stream shutdown. A custom timeout
+can delay shutdown until the outstanding read finishes.
 
-Native and static ARM64 builds pass. Protocol, image and payload-decoder tests
-pass with address/undefined-behavior sanitizers, as do nineteen simulated
-USB/HTTP integration tests. Original VFT image output matches the upstream
-fixture byte for byte.
+Native and static ARM64 builds, protocol/image/payload regressions and
+23 simulated USB/HTTP integration tests pass, including sanitizer checks.
+Tests cover activation clearing UVC configuration, recommit success/failure
+with and without early capture, timeout data retention and option validation.
+Published package/binary hashes are in `SHA256SUMS`.
 
-This is a **hardware-test prerelease**. Successful streaming on Steam Frame,
-actual frame dimensions/error rates, IR operation, orientation, sustained FPS,
-Baballonia tracking quality and service plug/unplug behavior remain unverified.
+This is a hardware-test prerelease. Successful streaming, actual dimensions,
+IR behavior, sustained FPS, tracking quality and service plug/unplug behavior
+still require physical validation.

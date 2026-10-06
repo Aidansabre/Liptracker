@@ -290,6 +290,67 @@ class Integration(unittest.TestCase):
         self.assertIn(b"prepare bulk capture", stderr)
         self.assertEqual(log.read_text(), "")
 
+    def test_activation_clears_uvc_configuration(self):
+        process, _, log = self.run_camera("bulk-recommit-required", backend=None,
+                                         options=("--startup-timeout", "1"))
+        _, stderr = process.communicate(timeout=5)
+        self.assertEqual(process.returncode, 1, stderr.decode())
+        self.assertIn(b"delivered=0", stderr)
+        self.check_shutdown(log)
+        for capture_first in (False, True):
+            with self.subTest(capture_first=capture_first):
+                options = ("--recommit-after-activation",)
+                if capture_first:
+                    options += ("--capture-first",)
+                process, port, log = self.run_camera("bulk-recommit-required", backend=None, options=options)
+                self.assertEqual(self.jpeg(process, port).size, (320, 480))
+                process.send_signal(signal.SIGTERM)
+                _, stderr = process.communicate(timeout=5)
+                self.assertEqual(process.returncode, 0, stderr.decode())
+                self.assertIn(b"UVC stream recommitted after Focus 3 activation", stderr)
+                events = log.with_suffix(".events").read_text().splitlines()
+                self.assertLess(events.index("ir-on"), events.index("recommit"))
+                self.check_shutdown(log)
+
+    def test_recommit_failure_cleanup(self):
+        for capture_first in (False, True):
+            with self.subTest(capture_first=capture_first):
+                options = ("--recommit-after-activation",)
+                if capture_first:
+                    options += ("--capture-first",)
+                process, _, log = self.run_camera("recommit-failure", backend=None, options=options)
+                _, stderr = process.communicate(timeout=5)
+                self.assertEqual(process.returncode, 1, stderr.decode())
+                self.assertIn(b"recommit after activation", stderr)
+                self.check_shutdown(log)
+                self.assertEqual(log.with_suffix(".events").read_text().splitlines(),
+                                 ["commit", "stream-off", "stream-on", "ir-on", "recommit", "ir-off", "stream-off", "close"])
+
+    def test_bulk_timeout_and_transfer_trace(self):
+        process, port, log = self.run_camera("bulk-partial-timeout", backend=None,
+                                            options=("--bulk-timeout", "1000"))
+        self.assertEqual(self.jpeg(process, port).size, (320, 480))
+        process.send_signal(signal.SIGTERM)
+        _, stderr = process.communicate(timeout=5)
+        self.assertEqual(process.returncode, 0, stderr.decode())
+        self.assertIn(b"timeout=1000ms", stderr)
+        self.assertIn(b"status=LIBUSB_ERROR_TIMEOUT (-7) requested=16384 bytes=1000 pending=1000", stderr)
+        self.assertIn(b"requested=15384 bytes=15384 pending=16384", stderr)
+        self.assertIn(b"header=12 flags=0x0c prefix=0c0c01000000", stderr)
+        self.check_shutdown(log)
+
+    def test_bulk_diagnostic_option_validation(self):
+        cases = (("--bulk-timeout", "0"), ("--bulk-timeout", "5001"),
+                 ("--recommit-after-activation", "--diagnose"),
+                 ("--bulk-timeout", "1000", "--probe-bulk"),
+                 ("--recommit-after-activation", "--capture-backend", "libuvc"),
+                 ("--recommit-after-activation", "--tracker", "vft"))
+        for options in cases:
+            with self.subTest(options=options):
+                result = subprocess.run([binary, *options], capture_output=True, timeout=5)
+                self.assertEqual(result.returncode, 2, result.stderr.decode())
+                self.assertNotIn(b"SET_CUR", result.stderr)
+
     def test_stall_cleanup(self):
         process, _, log = self.run_camera("stall")
         _, stderr = process.communicate(timeout=7)
