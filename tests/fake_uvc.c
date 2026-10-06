@@ -27,7 +27,7 @@ static atomic_int running;
 static atomic_int bulk_read_started;
 static pthread_t thread;
 static pthread_t main_thread;
-static atomic_int recommitted;
+static atomic_int committed_after_activation;
 static uvc_frame_callback_t *callback;
 static void *callback_context;
 static int mode(const char *name) {
@@ -86,6 +86,25 @@ int libusb_get_active_config_descriptor(libusb_device *dev, struct libusb_config
   return LIBUSB_SUCCESS;
 }
 void libusb_free_config_descriptor(struct libusb_config_descriptor *config) { free(config); }
+int libusb_get_device_speed(libusb_device *dev) {
+  assert(dev == &usb_device); return mode("full-speed") ? LIBUSB_SPEED_FULL : LIBUSB_SPEED_HIGH;
+}
+int libusb_get_max_packet_size(libusb_device *dev, unsigned char endpoint) {
+  assert(dev == &usb_device && endpoint == 0x81); return mode("full-speed") ? 64 : 512;
+}
+int libusb_clear_halt(libusb_device_handle *dev, unsigned char endpoint) {
+  assert(dev == &usb_handle && endpoint == 0x81 && !stream.started && !atomic_load(&running));
+  event("clear-halt");
+  return LIBUSB_SUCCESS;
+}
+int libusb_control_transfer(libusb_device_handle *dev, uint8_t type, uint8_t request, uint16_t value,
+                            uint16_t index, unsigned char *data, uint16_t length, unsigned int timeout) {
+  /* Only VS_STREAM_ERROR_CODE_CONTROL GET_CUR on the streaming interface. */
+  assert(dev == &usb_handle && type == 0xa1 && request == UVC_GET_CUR && value == 0x0600 &&
+         index == 1 && length == 1 && timeout);
+  data[0] = 5;
+  return 1;
+}
 const char *libusb_error_name(int error) {
   if (!error) return "LIBUSB_SUCCESS";
   if (error == LIBUSB_ERROR_TIMEOUT) return "LIBUSB_ERROR_TIMEOUT";
@@ -102,7 +121,7 @@ static int capture_transfer(unsigned char *data, int length, int *got, unsigned 
   for (unsigned waited = 0; (!sensor_on || !ir_on) && waited < timeout; waited += 5) usleep(5000);
   if (!sensor_on || !ir_on) return LIBUSB_ERROR_TIMEOUT;
   if (mode("bulk-empty") || (mode("bulk-stall") && frame_number) ||
-      (mode("bulk-recommit-required") && !recommitted)) {
+      (mode("bulk-recommit-required") && !committed_after_activation)) {
     usleep(timeout * 1000); return LIBUSB_ERROR_TIMEOUT;
   }
   if (mode("bulk-read-error")) return LIBUSB_ERROR_IO;
@@ -161,7 +180,6 @@ int uvc_set_ctrl(uvc_device_handle_t *dev, uint8_t unit, uint8_t selector, void 
   uint8_t *bytes = data;
   FILE *log = log_open();
   if (log) { for (int i = 0; i < length; i++) fprintf(log, "%02x", bytes[i]); fputc('\n', log); fclose(log); }
-  assert(stream.open); /* Vendor writes must follow the stream commit. */
   if (bytes[1] == 0x14) {
     if (bytes[3] == 1 && mode("capture-first-required") && !stream.started && !bulk_read_started) return UVC_ERROR_IO;
     sensor_on = bytes[3] == 1;
@@ -219,8 +237,9 @@ uvc_error_t uvc_stream_open_ctrl(uvc_device_handle_t *dev, uvc_stream_handle_t *
   assert(dev == &handle && !stream.open && ctrl->bInterfaceNumber == 1);
   event("commit");
   if (mode("commit-failure")) return UVC_ERROR_IO;
-  /* Simulate a camera whose UVC configuration resets vendor activation. */
-  sensor_on = ir_on = 0;
+  /* bulk-recommit-required: a camera that streams only after a commit
+   * following vendor activation. */
+  if (sensor_on && ir_on) atomic_store(&committed_after_activation, 1);
   stream.open = 1;
   *out = &stream;
   return UVC_SUCCESS;
@@ -230,7 +249,7 @@ uvc_error_t uvc_stream_ctrl(uvc_stream_handle_t *capture, uvc_stream_ctrl_t *ctr
   assert(sensor_on && ir_on);
   event("recommit");
   if (mode("recommit-failure")) return UVC_ERROR_IO;
-  atomic_store(&recommitted, 1);
+  atomic_store(&committed_after_activation, 1);
   return UVC_SUCCESS;
 }
 uvc_error_t uvc_stream_start(uvc_stream_handle_t *capture, uvc_frame_callback_t *cb,

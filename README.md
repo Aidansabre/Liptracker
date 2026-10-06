@@ -68,10 +68,10 @@ Options:
 --xu-unit 1–255          override the discovered extension unit
 --rotation 0|90|180|270  Focus 3 rotation in degrees CCW (default 90)
 --startup-timeout 1–120 first usable frame deadline in seconds (default 10)
---capture-first        Focus 3: queue USB capture before vendor activation
+--capture-first        Focus 3: commit and queue USB capture before vendor activation
 --capture-backend auto|bulk|libuvc  default auto: Focus 3 bulk, VFT libuvc
 --allow-uvc-errors     inspect complete Focus 3 bulk frames carrying UVC ERR
---recommit-after-activation  Focus 3 bulk: reapply UVC mode after activation
+--recommit-after-activation  Focus 3 bulk: commit before and again after activation
 --bulk-timeout 50–5000 bulk read timeout in milliseconds (default 250)
 --probe-bulk           Focus 3: read raw USB transfers for diagnosis, then exit
 --diagnose              inspect descriptors without activating the tracker
@@ -80,8 +80,12 @@ Options:
 If the camera is sideways or upside-down, stop it with Ctrl+C and try another
 `--rotation` value. `-r` exposes the complete 640×481 source image for comparison.
 The Focus 3 profile does not apply the older VFT's crop or gamma correction.
-Focus 3 capture commits the UVC mode before enabling the sensor and IR, then
-reads the bulk endpoint without another mode commit. Payloads are assembled
+Focus 3 capture follows the reference's order: vendor activation (stream off,
+stream on, IR on), then the UVC commit, then bulk reads straight away. This is
+what the reference's DirectShow graph does when it starts running after the
+controller is created. Before committing and after capture stops, the bulk
+endpoint receives CLEAR_FEATURE(HALT), which is how Windows and Linux uvcvideo
+tell a bulk camera to stop streaming; libuvc never sends it. Payloads are assembled
 using frame ID, timestamp and end-of-frame boundaries. Partial data returned
 with USB timeouts is retained; incomplete and error-marked frames are rejected.
 The first usable frame has a
@@ -105,8 +109,13 @@ capture by default for Focus 3; successful streaming still needs hardware testin
 The `.4` direct reader also stalled on hardware: the default run received only
 163840 bytes in ten seconds, and capture-before-activation received four
 payloads before stream-on and then stalled. Neither run delivered a full frame.
-The `.5` diagnostics below test stream-commit ordering and USB timeout length;
-they are hypotheses to test rather than verified fixes.
+Every observed run received about four 32768-byte payloads after a commit and
+then nothing, whatever the commit/activation order. That pattern fits a camera
+that overran its buffers (UVC ERR) and stopped. Startup now prints the USB link
+speed and endpoint packet size: the 640×481 YUY2 mode needs about 18.5 MB/s, so
+a full-speed (12 Mbit/s) link cannot carry it and triggers a warning. The first
+ERR payloads are followed by the camera's own stream error code (for example
+`output buffer overrun`). These two lines are the most useful part of a log.
 If capture stalls, share the complete application output from this command:
 
 ```sh
@@ -114,8 +123,8 @@ sudo ./vft-stream --tracker focus3 2>focus3-capture.log
 cat focus3-capture.log
 ```
 
-To check whether vendor activation clears the UVC streaming configuration,
-reapply the same negotiated commit after activation:
+To compare with the older `.2`–`.5` order (commit before activation), with a
+second commit after activation:
 
 ```sh
 sudo ./vft-stream --tracker focus3 --recommit-after-activation 2>focus3-recommit.log
@@ -136,9 +145,9 @@ data, timestamps and the first twelve payload prefixes. The UVC commit option
 and custom timeout apply only to Focus 3 direct capture. Shutdown can wait up to
 the selected read timeout for an outstanding USB request to finish.
 
-Try the alternative activation timing, which queues USB reads before sending the
-same sensor/IR commands. The default order is
-commit, vendor activation, capture:
+Try the alternative activation timing, which commits and queues USB reads
+before sending the same sensor/IR commands. The default order is
+vendor activation, commit, capture:
 
 ```sh
 sudo ./vft-stream --tracker focus3 --capture-first
@@ -247,7 +256,7 @@ Version tags beginning with `v` run `.github/workflows/release.yml`. The workflo
 builds native and static ARM64 binaries, runs the regression/sanitizer/integration
 checks, and publishes a hardware-test prerelease with the ARM64 executable,
 complete Steam Frame package and checksums. The current release is
-`v0.3.0-focus3.5`. The same workflow can be started manually with an existing
+`v0.3.0-focus3.6`. The same workflow can be started manually with an existing
 version tag if needed. Physical hardware validation remains required.
 
 ## Tests and validation status
@@ -263,7 +272,8 @@ SANITIZE=1 sh tests/integration.sh
 Integration tests install Pillow 11.3.0 into the tools cache, simulate USB delivery,
 and exercise the real capture callback, JPEG encoder, HTTP server and cleanup.
 They verify decoded JPEG dimensions/pixels, reconnection, diagnostics without
-activation, device rejection, commit-before-activation ordering, startup failures,
+activation, device rejection, commit-after-activation ordering, endpoint halts,
+link-speed warnings, stream error codes, startup failures,
 busy ports, delayed first frames, rejected frames, stalled capture, capture-before-
 activation cleanup and direct bulk capture with partial timeouts and USB errors.
 Decoder tests cover the observed 12-byte headers, frame boundaries, recovery

@@ -4,6 +4,9 @@
 #include <libuvc/libuvc.h>
 struct bulk_capture;
 int bulk_endpoint(uvc_device_handle_t *, const uvc_stream_ctrl_t *, uint8_t *);
+void bulk_report_link(uvc_device_handle_t *, const uvc_stream_ctrl_t *, uint8_t);
+int bulk_clear_halt(uvc_device_handle_t *, uint8_t, const char *);
+void bulk_report_stream_error(uvc_device_handle_t *, uint8_t);
 int bulk_capture_open(uvc_device_handle_t *, const uvc_stream_ctrl_t *,
                       unsigned, unsigned, int, unsigned, struct bulk_capture **);
 int bulk_capture_start(struct bulk_capture *, uvc_frame_callback_t *, void *);

@@ -103,8 +103,11 @@ class Integration(unittest.TestCase):
         self.check_shutdown(log)
         self.assertEqual(len(log.read_text().splitlines()), 5)
         self.assertEqual(log.with_suffix(".events").read_text().splitlines(),
-                         ["commit", "stream-off", "stream-on", "ir-on", "start",
-                          "stop", "ir-off", "stream-off", "close"])
+                         ["clear-halt", "stream-off", "stream-on", "ir-on", "commit", "start",
+                          "stop", "clear-halt", "ir-off", "stream-off", "close"])
+        self.assertIn(b"USB link speed=high (480 Mbit/s) bulk endpoint=0x81 max-packet=512 needs=18.5 MB/s",
+                      stderr)
+        self.assertIn(b"UVC stream committed after Focus 3 activation", stderr)
 
     def test_raw_odd_height(self):
         process, port, log = self.run_camera(options=("-r",))
@@ -136,15 +139,27 @@ class Integration(unittest.TestCase):
                 process.communicate(timeout=5)
                 self.assertEqual(process.returncode, 1)
                 self.check_shutdown(log)
-                self.assertEqual(log.with_suffix(".events").read_text().splitlines()[-1], "close")
+                # A failed activation never commits the stream.
+                events = log.with_suffix(".events").read_text().splitlines()
+                self.assertEqual(events[-1], "stream-off" if mode == "control-failure" else "close")
+                self.assertEqual("commit" in events, mode == "start-failure")
 
-    def test_commit_failure_does_not_activate(self):
+    def test_commit_failure_after_activation_cleans_up(self):
         process, _, log = self.run_camera("commit-failure")
         _, stderr = process.communicate(timeout=5)
         self.assertEqual(process.returncode, 1)
         self.assertIn(b"commit capture stream", stderr)
-        self.assertEqual(log.read_text(), "")
-        self.assertEqual(log.with_suffix(".events").read_text().splitlines(), ["commit"])
+        self.check_shutdown(log)
+        self.assertEqual(log.with_suffix(".events").read_text().splitlines(),
+                         ["clear-halt", "stream-off", "stream-on", "ir-on", "commit", "ir-off", "stream-off"])
+
+    def test_full_speed_link_warning(self):
+        process, port, _ = self.run_camera("full-speed", options=("--startup-timeout", "1"))
+        self.assertEqual(self.jpeg(process, port).size, (320, 480))
+        process.send_signal(signal.SIGTERM)
+        _, stderr = process.communicate(timeout=5)
+        self.assertIn(b"USB link speed=full (12 Mbit/s) bulk endpoint=0x81 max-packet=64", stderr)
+        self.assertIn(b"not on a high-speed USB link", stderr)
 
     def test_startup_callback_diagnostics(self):
         for mode in ("no-callbacks", "rejected-frames"):
@@ -189,8 +204,9 @@ class Integration(unittest.TestCase):
                 self.assertNotIn(b"first callback:", stderr)
                 self.check_shutdown(log)
                 self.assertEqual(log.with_suffix(".events").read_text().splitlines(),
-                                 ["commit", "stream-off", "stream-on", "ir-on",
-                                  "bulk-read", "bulk-read", "bulk-read", "ir-off", "stream-off", "close"])
+                                 ["clear-halt", "stream-off", "stream-on", "ir-on", "commit",
+                                  "bulk-read", "bulk-read", "bulk-read", "clear-halt",
+                                  "ir-off", "stream-off", "close"])
 
     def test_bulk_probe_errors_and_empty_capture(self):
         for mode, message in (("probe-empty", b"bytes=0 timeouts="),
@@ -214,7 +230,8 @@ class Integration(unittest.TestCase):
         self.assertIn(b"USB capture queued before Focus 3 activation", stderr)
         self.check_shutdown(log)
         self.assertEqual(log.with_suffix(".events").read_text().splitlines(),
-                         ["commit", "start", "stream-off", "stream-on", "ir-on", "stop", "ir-off", "stream-off", "close"])
+                         ["clear-halt", "commit", "start", "stream-off", "stream-on", "ir-on",
+                          "stop", "clear-halt", "ir-off", "stream-off", "close"])
 
     def test_capture_first_failure_cleanup(self):
         for mode in ("start-failure", "control-failure"):
@@ -225,10 +242,10 @@ class Integration(unittest.TestCase):
                 events = log.with_suffix(".events").read_text().splitlines()
                 if mode == "start-failure":
                     self.assertEqual(log.read_text(), "")
-                    self.assertEqual(events, ["commit", "start", "close"])
+                    self.assertEqual(events, ["clear-halt", "commit", "start", "clear-halt", "close"])
                 else:
                     self.check_shutdown(log)
-                    self.assertEqual(events[-4:], ["stop", "ir-off", "stream-off", "close"])
+                    self.assertEqual(events[-5:], ["stop", "clear-halt", "ir-off", "stream-off", "close"])
 
     def test_default_bulk_mjpeg_and_partial_recovery(self):
         for mode in ("", "bulk-partial-timeout", "bulk-first-short", "bulk-error-recovery"):
@@ -259,6 +276,7 @@ class Integration(unittest.TestCase):
                     self.assertIn(b"max-frame=614400 expected=615680", stderr)
                 if mode == "bulk-error":
                     self.assertIn(b"error=1 incomplete=0", stderr)
+                    self.assertIn(b"UVC stream error code=5 (output buffer overrun)", stderr)
                 self.check_shutdown(log)
 
     def test_bulk_error_inspection_and_raw_image(self):
@@ -290,9 +308,18 @@ class Integration(unittest.TestCase):
         self.assertIn(b"prepare bulk capture", stderr)
         self.assertEqual(log.read_text(), "")
 
-    def test_activation_clears_uvc_configuration(self):
+    def test_commit_follows_activation(self):
+        # Default: the reference order (activate, then commit and read).
+        process, port, log = self.run_camera("bulk-recommit-required", backend=None)
+        self.assertEqual(self.jpeg(process, port).size, (320, 480))
+        process.send_signal(signal.SIGTERM)
+        _, stderr = process.communicate(timeout=5)
+        self.assertEqual(process.returncode, 0, stderr.decode())
+        events = log.with_suffix(".events").read_text().splitlines()
+        self.assertLess(events.index("ir-on"), events.index("commit"))
+        self.check_shutdown(log)
         process, _, log = self.run_camera("bulk-recommit-required", backend=None,
-                                         options=("--startup-timeout", "1"))
+                                         options=("--capture-first", "--startup-timeout", "1"))
         _, stderr = process.communicate(timeout=5)
         self.assertEqual(process.returncode, 1, stderr.decode())
         self.assertIn(b"delivered=0", stderr)
@@ -307,8 +334,10 @@ class Integration(unittest.TestCase):
                 process.send_signal(signal.SIGTERM)
                 _, stderr = process.communicate(timeout=5)
                 self.assertEqual(process.returncode, 0, stderr.decode())
+                self.assertIn(b"UVC stream committed before Focus 3 activation", stderr)
                 self.assertIn(b"UVC stream recommitted after Focus 3 activation", stderr)
                 events = log.with_suffix(".events").read_text().splitlines()
+                self.assertLess(events.index("commit"), events.index("stream-off"))
                 self.assertLess(events.index("ir-on"), events.index("recommit"))
                 self.check_shutdown(log)
 
@@ -324,7 +353,8 @@ class Integration(unittest.TestCase):
                 self.assertIn(b"recommit after activation", stderr)
                 self.check_shutdown(log)
                 self.assertEqual(log.with_suffix(".events").read_text().splitlines(),
-                                 ["commit", "stream-off", "stream-on", "ir-on", "recommit", "ir-off", "stream-off", "close"])
+                                 ["clear-halt", "commit", "stream-off", "stream-on", "ir-on", "recommit",
+                                  "clear-halt", "ir-off", "stream-off", "close"])
 
     def test_bulk_timeout_and_transfer_trace(self):
         process, port, log = self.run_camera("bulk-partial-timeout", backend=None,
@@ -359,8 +389,14 @@ class Integration(unittest.TestCase):
         self.check_shutdown(log)
 
     def test_busy_port_does_not_activate(self):
-        with socket.socket(socket.AF_INET6) as listener:
-            listener.bind(("::", 0))
+        family, address = (socket.AF_INET6, "::") if socket.has_ipv6 else (socket.AF_INET, "")
+        try:
+            listener = socket.socket(family)
+        except OSError:  # IPv6 compiled in but unavailable in this kernel.
+            family, address = socket.AF_INET, ""
+            listener = socket.socket(family)
+        with listener:
+            listener.bind((address, 0))
             listener.listen()
             port = listener.getsockname()[1]
             log = Path(self.directory.name) / "busy.log"

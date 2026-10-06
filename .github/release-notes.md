@@ -1,51 +1,36 @@
-Focus 3 stream-commit and USB-timeout diagnostics for Steam Frame.
+Focus 3: reference activation order, bulk endpoint halt and link diagnostics.
 
-The .4 direct reader also stalled on physical hardware. The default run
-received 163840 bytes in ten seconds; capture-before-activation received four
-32768-byte payloads before stream-on and then stalled. Neither run delivered
-one complete image. This is not enough data to establish whether the camera
-actually produces 640×480 or its advertised 640×481 frames.
+Every hardware run so far (`.1` to `.5`) received about four 32768-byte payloads
+after the UVC commit and then stalled, whatever the commit/activation order.
 
-This release adds controlled comparisons:
+Changes:
 
-- `--recommit-after-activation` reapplies the same negotiated UVC streaming
-  commit after the vendor activation commands, testing whether activation
-  clears the earlier stream configuration.
-- `--bulk-timeout 1000` changes the bulk read timeout from 250 ms to one second,
-  testing whether repeated timeout cancellations contribute to the stall.
-- Initial transfer logs now include statuses, timestamps, pending partial
-  bytes and the first twelve payload prefixes.
+- The default order matches the reference app again: vendor activation
+  (stream off, stream on, IR on), then UVC commit, then capture straight away.
+  The `.2`–`.5` order remains available via `--capture-first` and
+  `--recommit-after-activation`.
+- CLEAR_FEATURE(HALT) is sent to the bulk streaming endpoint before the commit
+  and after capture stops, as Windows and Linux uvcvideo do. libuvc never sends it.
+- Startup prints the USB link speed, endpoint packet size and required data rate
+  (about 18.5 MB/s). It warns when the tracker is not on a high-speed link.
+- The first payloads carrying UVC ERR are followed by the camera's stream error
+  code (for example `output buffer overrun`).
+- The HTTP server falls back to IPv4 when the kernel has no IPv6.
 
-These are diagnostic hypotheses, not verified hardware fixes. The original
-VFT capture path and the Focus 3 activation bytes are preserved.
-
-Download `vft-stream-focus3-steam-frame.tar.gz` for the static ARM64 executable,
-source, helper scripts, reference review and license notices. Stop other camera
-processes and unplug/reconnect the tracker before each comparison.
-
-First run:
+Download `vft-stream-focus3-steam-frame.tar.gz`, unplug/reconnect the tracker,
+stop other camera processes and run:
 
 ```sh
-sudo ./vft-stream --tracker focus3 --recommit-after-activation 2>focus3-recommit.log
-cat focus3-recommit.log
+sudo ./vft-stream --tracker focus3 2>focus3-capture.log
+cat focus3-capture.log
 ```
 
-Then unplug/reconnect and run the timeout comparison separately:
-
-```sh
-sudo ./vft-stream --tracker focus3 --bulk-timeout 1000 2>focus3-timeout.log
-cat focus3-timeout.log
-```
-
-Share both complete logs if streaming stalls. If it starts, connect to
+Share the complete log if streaming stalls, especially the `USB link speed=` and
+`UVC stream error code=` lines. If it starts, connect to
 `http://<Steam-Frame-IP>:8085/` and confirm image visibility/orientation.
-Ctrl+C stops capture and attempts normal IR/stream shutdown. A custom timeout
-can delay shutdown until the outstanding read finishes.
 
 Native and static ARM64 builds, protocol/image/payload regressions and
-23 simulated USB/HTTP integration tests pass, including sanitizer checks.
-Tests cover activation clearing UVC configuration, recommit success/failure
-with and without early capture, timeout data retention and option validation.
+24 simulated USB/HTTP integration tests pass, including sanitizer checks.
 Published package/binary hashes are in `SHA256SUMS`.
 
 This is a hardware-test prerelease. Successful streaming, actual dimensions,

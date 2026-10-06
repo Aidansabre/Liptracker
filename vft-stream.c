@@ -214,11 +214,19 @@ static void *client(void *arg) {
 
 static int open_server(int port) {
   int s = socket(AF_INET6, SOCK_STREAM, 0), one = 1, zero = 0;
+  struct sockaddr_in6 a6 = {.sin6_family = AF_INET6, .sin6_port = htons(port), .sin6_addr = in6addr_any};
+  struct sockaddr_in a4 = {.sin_family = AF_INET, .sin_port = htons(port), .sin_addr.s_addr = htonl(INADDR_ANY)};
+  struct sockaddr *a = (struct sockaddr *)&a6;
+  socklen_t size = sizeof a6;
+  if (s < 0 && errno == EAFNOSUPPORT) { /* Kernel without IPv6. */
+    s = socket(AF_INET, SOCK_STREAM, 0);
+    a = (struct sockaddr *)&a4;
+    size = sizeof a4;
+  }
   if (s < 0) return -1;
   setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
-  setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, &zero, sizeof zero);
-  struct sockaddr_in6 a = {.sin6_family = AF_INET6, .sin6_port = htons(port), .sin6_addr = in6addr_any};
-  if (bind(s, (struct sockaddr *)&a, sizeof a) < 0 || listen(s, 8) < 0) {
+  if (a->sa_family == AF_INET6) setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, &zero, sizeof zero);
+  if (bind(s, a, size) < 0 || listen(s, 8) < 0) {
     int saved = errno;
     close(s);
     errno = saved;
@@ -352,15 +360,18 @@ static int probe_bulk(uvc_device_handle_t *h, const uvc_stream_ctrl_t *ctrl, int
     int report = reads <= 3 || got > 0 || (r && r != LIBUSB_ERROR_TIMEOUT);
     if (report)
       fprintf(stderr, "vft-stream: bulk read %u: %s (%d) bytes=%d", reads, libusb_error_name(r), r, got);
+    int uvc_error = 0;
     if (got > 0 && got <= length) {
       bytes += got;
       nonempty++;
+      uvc_error = got >= 2 && data[0] >= 2 && (data[1] & 0x40);
       if (report) {
         fprintf(stderr, " prefix=");
         for (int i = 0; i < got && i < 16; i++) fprintf(stderr, "%02x", data[i]);
       }
     }
     if (report) fputc('\n', stderr);
+    if (uvc_error) bulk_report_stream_error(h, ctrl->bInterfaceNumber);
     if (r && r != LIBUSB_ERROR_TIMEOUT) { fatal = 1; break; }
     if (!r && !got) msleep(20); /* Avoid spinning on repeated empty packets. */
   }
@@ -383,13 +394,26 @@ static void usage(int status) {
           "  --rotation 0|90|180|270   Focus 3 degrees CCW (default 90)\n"
           "  --startup-timeout 1-120   first usable frame deadline (default 10s)\n"
           "  --probe-bulk              Focus 3 raw USB transfer diagnostic, then exit\n"
-          "  --capture-first           Focus 3: queue capture before vendor activation\n"
+          "  --capture-first           Focus 3: commit and queue capture before vendor activation\n"
           "  --capture-backend auto|bulk|libuvc  Focus 3 defaults to direct bulk reads\n"
           "  --allow-uvc-errors        inspect full Focus 3 frames carrying UVC ERR\n"
-          "  --recommit-after-activation  Focus 3 bulk: reapply UVC mode after activation\n"
+          "  --recommit-after-activation  Focus 3 bulk: commit before and again after activation\n"
           "  --bulk-timeout 50-5000    bulk read timeout in ms (default 250)\n"
           "  --diagnose               print USB/UVC descriptors without activation\n");
   exit(status);
+}
+
+/* VS_COMMIT. Focus 3 commits after vendor activation by default, as the
+ * reference's DirectShow graph does when it starts running. */
+static int commit_stream(uvc_device_handle_t *h, uvc_stream_ctrl_t *ctrl,
+                         uvc_stream_handle_t **capture, const char *when) {
+  int r = uvc_stream_open_ctrl(h, capture, ctrl);
+  if (r < 0) {
+    fprintf(stderr, "vft-stream: commit capture stream: %s\n", uvc_strerror(r));
+    return r;
+  }
+  fprintf(stderr, "vft-stream: UVC stream committed %s Focus 3 activation\n", when);
+  return 0;
 }
 
 static int parse_number(const char *text, int base, int low, int high) {
@@ -467,7 +491,8 @@ int main(int argc, char **argv) {
   struct bulk_capture *bulk = NULL;
   struct usb_control usb = {0};
   struct tracker_io io = {.context = &usb, .send = control_send, .sleep_ms = control_sleep};
-  int rc = 1, activation_attempted = 0, streaming = 0, server_fd = -1;
+  int rc = 1, activation_attempted = 0, streaming = 0, server_fd = -1, have_endpoint = 0;
+  uint8_t endpoint = 0;
   if ((r = uvc_init(&ctx, NULL)) < 0) uvc_die("uvc_init", r);
   if ((r = uvc_get_device_list(ctx, &devices)) < 0) {
     fprintf(stderr, "vft-stream: enumerate cameras: %s\n", uvc_strerror(r));
@@ -530,13 +555,15 @@ int main(int argc, char **argv) {
     }
   }
   if (profile == TRACKER_FOCUS3) {
-    /* open_ctrl performs VS_COMMIT. Finish configuration before vendor enable;
-     * stream_start then queues transfers without committing the mode again. */
-    if ((r = uvc_stream_open_ctrl(h, &capture, &ctrl)) < 0) {
-      fprintf(stderr, "vft-stream: commit capture stream: %s\n", uvc_strerror(r));
-      goto cleanup;
+    /* Report the link and end any stream an earlier run left active, as
+     * Windows does when it stops a bulk camera. The probe claimed the interface. */
+    if (!bulk_endpoint(h, &ctrl, &endpoint)) {
+      have_endpoint = 1;
+      bulk_report_link(h, &ctrl, endpoint);
+      bulk_clear_halt(h, endpoint, "before commit");
     }
-    fprintf(stderr, "vft-stream: UVC stream committed before Focus 3 activation\n");
+    /* Diagnostic orderings that commit before the vendor enable. */
+    if ((capture_first || recommit) && commit_stream(h, &ctrl, &capture, "before")) goto cleanup;
   }
   if (use_bulk) {
     if ((r = bulk_capture_open(h, &ctrl, width, height, allow_uvc_errors, bulk_timeout, &bulk)) < 0) {
@@ -566,6 +593,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "vft-stream: UVC stream recommitted after Focus 3 activation\n");
   }
   if (bulk_diagnostic) {
+    if (commit_stream(h, &ctrl, &capture, "after")) goto cleanup;
     rc = probe_bulk(h, &ctrl, startup_timeout);
     goto cleanup;
   }
@@ -578,6 +606,9 @@ int main(int argc, char **argv) {
   pthread_detach(srv);
 
   if (!streaming) {
+    /* Reference order: activate, then commit and read straight away. */
+    if (profile == TRACKER_FOCUS3 && !capture && commit_stream(h, &ctrl, &capture, "after"))
+      goto cleanup;
     clock_gettime(CLOCK_MONOTONIC, &last_frame);
     r = bulk ? bulk_capture_start(bulk, on_frame, NULL) :
         capture ? uvc_stream_start(capture, on_frame, NULL, 0) :
@@ -618,6 +649,7 @@ cleanup:
     else if (capture) uvc_stream_stop(capture);
     else uvc_stop_streaming(h);
   }
+  if (have_endpoint && capture) bulk_clear_halt(h, endpoint, "stop stream");
   if (activation_attempted && tracker_set_state(profile, 0, &io)) {
     fprintf(stderr, "vft-stream: tracker shutdown failed (device may be disconnected)\n");
     rc = 1;

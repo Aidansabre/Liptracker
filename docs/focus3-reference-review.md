@@ -97,3 +97,28 @@ partial timeout data.
 Logs include the first twelve payload prefixes and read statuses/timestamps,
 including data received with timeouts. This provides visibility into later
 headers and frame boundaries that the earlier three-prefix log omitted.
+
+## Reference order restored, `.6` diagnostics
+
+The reference creates its `TrackerController` (stream off, stream on, IR on)
+after building the DirectShow graph and before `graph.run()`. The Windows driver
+commits the stream and starts bulk reads when the graph runs, so the reference
+order is activation, then commit, then capture. `.2` reversed this without
+hardware evidence; the default is the reference order again. The earlier order
+remains available through `--capture-first` and `--recommit-after-activation`.
+
+All hardware runs so far (`.1` activation first with libuvc, `.4` commit first,
+capture-before-activation) received about four 32768-byte payloads after the
+commit and then stalled. The ordering alone therefore does not explain the
+failure. Two USB-level differences from Windows remain:
+
+- Windows and Linux uvcvideo stop a bulk stream with CLEAR_FEATURE(HALT) on the
+  streaming endpoint. libuvc does not (`uvc_stream_stop` has a
+  "stop the actual stream, camera side?" todo), and neither did the direct
+  reader. A camera that was never told to stop may keep its earlier state.
+  The halt is now sent before the commit and after capture stops.
+- Link capacity. 640×481 YUY2 at 30 FPS is about 18.5 MB/s. A full-speed link,
+  or a congested shared one, overruns the camera's buffers. That matches UVC ERR
+  within the first few payloads followed by silence. The startup log now reports
+  link speed, endpoint packet size and the required rate. It also reads
+  VS_STREAM_ERROR_CODE_CONTROL for the first ERR payloads.

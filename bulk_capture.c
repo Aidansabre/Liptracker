@@ -11,8 +11,9 @@
 #include <time.h>
 
 struct bulk_capture {
+  uvc_device_handle_t *uvc;
   libusb_device_handle *usb;
-  uint8_t endpoint, *payload;
+  uint8_t endpoint, interface, *payload;
   size_t length;
   unsigned width, height, timeout;
   struct uvc_bulk_decoder decoder;
@@ -22,6 +23,7 @@ struct bulk_capture {
   atomic_int running;
   int started;
   uint64_t reads, bytes, timeouts;
+  unsigned error_reports;
 };
 int bulk_endpoint(uvc_device_handle_t *h, const uvc_stream_ctrl_t *ctrl, uint8_t *endpoint) {
   libusb_device_handle *usb = uvc_get_libusb_handle(h);
@@ -54,6 +56,52 @@ int bulk_endpoint(uvc_device_handle_t *h, const uvc_stream_ctrl_t *ctrl, uint8_t
   }
   return 0;
 }
+static const char *speed_name(int speed) {
+  switch (speed) {
+    case LIBUSB_SPEED_LOW: return "low (1.5 Mbit/s)";
+    case LIBUSB_SPEED_FULL: return "full (12 Mbit/s)";
+    case LIBUSB_SPEED_HIGH: return "high (480 Mbit/s)";
+    case LIBUSB_SPEED_SUPER: return "super (5 Gbit/s)";
+    default: return speed > LIBUSB_SPEED_SUPER ? "super+" : "unknown";
+  }
+}
+/* 640x481 YUY2 at 30 FPS needs about 18.5 MB/s, which only high speed or
+ * faster can carry. A slower link overruns the camera's buffers (UVC ERR). */
+void bulk_report_link(uvc_device_handle_t *h, const uvc_stream_ctrl_t *ctrl, uint8_t endpoint) {
+  libusb_device *dev = libusb_get_device(uvc_get_libusb_handle(h));
+  int speed = libusb_get_device_speed(dev);
+  double needed = ctrl->dwFrameInterval ?
+      (double)ctrl->dwMaxVideoFrameSize * 10000000.0 / ctrl->dwFrameInterval / 1e6 : 0;
+  fprintf(stderr, "vft-stream: USB link speed=%s bulk endpoint=0x%02x max-packet=%d needs=%.1f MB/s\n",
+          speed_name(speed), endpoint, libusb_get_max_packet_size(dev, endpoint), needed);
+  if (speed != LIBUSB_SPEED_UNKNOWN && speed < LIBUSB_SPEED_HIGH)
+    fprintf(stderr, "vft-stream: WARNING: the tracker is not on a high-speed USB link; "
+            "this mode cannot stream (check the cable, adapter or hub)\n");
+}
+/* Windows and Linux uvcvideo stop a bulk UVC stream with CLEAR_FEATURE(HALT)
+ * on the streaming endpoint; libuvc never does. Without it the camera keeps
+ * its previous streaming state. */
+int bulk_clear_halt(uvc_device_handle_t *h, uint8_t endpoint, const char *why) {
+  int r = libusb_clear_halt(uvc_get_libusb_handle(h), endpoint);
+  fprintf(stderr, "vft-stream: CLEAR_FEATURE(HALT) endpoint=0x%02x %s: %s\n",
+          endpoint, why, libusb_error_name(r));
+  return r;
+}
+/* VS_STREAM_ERROR_CODE_CONTROL explains why a payload carried UVC ERR. */
+void bulk_report_stream_error(uvc_device_handle_t *h, uint8_t interface) {
+  static const char *const names[] = {"no error", "protected content", "input buffer underrun",
+    "data discontinuity", "output buffer underrun", "output buffer overrun",
+    "format change", "still image capture error"};
+  uint8_t code = 0;
+  int r = libusb_control_transfer(uvc_get_libusb_handle(h), 0xa1, UVC_GET_CUR, 0x06 << 8,
+                                  interface, &code, 1, 100);
+  if (r == 1)
+    fprintf(stderr, "vft-stream: UVC stream error code=%u (%s)\n", code,
+            code < sizeof names / sizeof *names ? names[code] : "unknown");
+  else
+    fprintf(stderr, "vft-stream: UVC stream error code unavailable: %s\n",
+            r < 0 ? libusb_error_name(r) : "short read");
+}
 static void ready(void *user, const uint8_t *data, size_t size) {
   struct bulk_capture *b = user;
   uvc_frame_t frame = {.data = (void *)data, .data_bytes = size, .width = b->width,
@@ -76,8 +124,10 @@ int bulk_capture_open(uvc_device_handle_t *h, const uvc_stream_ctrl_t *ctrl,
     return UVC_ERROR_INVALID_MODE;
   struct bulk_capture *b = calloc(1, sizeof *b);
   if (!b) return UVC_ERROR_NO_MEM;
+  b->uvc = h;
   b->usb = uvc_get_libusb_handle(h);
   b->endpoint = endpoint;
+  b->interface = ctrl->bInterfaceNumber;
   b->length = ctrl->dwMaxPayloadTransferSize;
   b->width = width; b->height = height;
   b->timeout = timeout;
@@ -119,6 +169,10 @@ static void *read_loop(void *user) {
         for (size_t i = 0; i < used && i < 24; i++) fprintf(stderr, "%02x", b->payload[i]);
         fputc('\n', stderr);
         funlockfile(stderr);
+      }
+      if (used >= 2 && b->payload[0] >= 2 && (b->payload[1] & 0x40) && b->error_reports < 3) {
+        b->error_reports++;
+        bulk_report_stream_error(b->uvc, b->interface);
       }
       uvc_bulk_feed(&b->decoder, b->payload, used);
       used = 0;
