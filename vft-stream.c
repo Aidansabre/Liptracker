@@ -1,0 +1,461 @@
+// vft-stream — switch on a Vive Facial Tracker and serve it as an MJPEG stream.
+//
+// Licensed under the Babble Software Distribution License 1.0 (see LICENSE):
+// non-commercial use only, derivatives under the same license with source.
+//
+// This is a modified work of Project Babble's Baballonia
+// (https://github.com/Project-Babble/Baballonia, commit 5dbd332): a C
+// translation of the VFT activation and image pipeline in
+//   src/Baballonia.VFTCapture/Linux/LinuxUsbCommunicator.cs
+//   src/Baballonia.VFTCapture/Linux/LinuxVFTCapture.cs
+//   src/Baballonia.VFTCapture/VFTCommon.cs
+// Changes 2026: Focus 3 profile, device/XU selection, diagnostics, and cleanup.
+// Changes: ported from C# to C, OpenCV operations reimplemented by hand, the
+// kernel V4L2/UVC ioctls replaced by libuvc, and an MJPEG HTTP server added.
+// The VFT protocol was reverse engineered by DragonLord for Project Babble:
+// https://docs.babble.diy/blog/reverse-engineering-the-vive-facial-tracker
+//
+// Runs on whatever the tracker is plugged into (the Steam Frame) so Baballonia
+// can consume it elsewhere as a "Wireless/IP Camera" (http://host:port/).
+//
+// The tracker is driven from userspace through libuvc/libusb rather than the
+// kernel's uvcvideo: the Steam Frame's kernel ships no uvcvideo at all, so the
+// tracker's interfaces sit unbound and there is no /dev/video node to open.
+// The flip side is that it needs usbfs access — root, or the udev rule
+// install-service.sh writes.
+//
+// Baballonia applies the image pipeline only on its own VFT capture path, not
+// to IP cameras, so it has to happen here or the model sees a raw stereo
+// frame it was never trained on.
+
+#define _GNU_SOURCE
+#include <errno.h>
+#include <getopt.h>
+#include <libuvc/libuvc.h>
+#include <math.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <time.h>
+#include <unistd.h>
+
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#define STBI_WRITE_NO_STDIO
+#include <stb_image_write.h>
+
+#include "tracker.h"
+#include "image.h"
+
+static volatile sig_atomic_t stop;
+static void on_signal(int s) { (void)s; stop = 1; }
+
+static void uvc_die(const char *what, int err) {
+  fprintf(stderr, "vft-stream: %s: %s\n", what, uvc_strerror(err));
+  exit(1);
+}
+
+static void msleep(int ms) {
+  struct timespec ts = {ms / 1000, (ms % 1000) * 1000000L};
+  nanosleep(&ts, NULL);
+}
+
+struct usb_control { uvc_device_handle_t *handle; uint8_t unit; };
+static enum tracker_profile profile = TRACKER_AUTO;
+static int rotation = 90;
+
+static void control_sleep(void *context, unsigned milliseconds) {
+  (void)context;
+  msleep(milliseconds);
+}
+
+static int control_send(void *context, const uint8_t *command, size_t length, int ack) {
+  struct usb_control *usb = context;
+  int r = uvc_set_ctrl(usb->handle, usb->unit, 2, (void *)command, length);
+  if (r < 0 || (size_t)r != length) {
+    fprintf(stderr, "vft-stream: XU %u SET_CUR: %s (%d bytes)\n", usb->unit,
+            r < 0 ? uvc_strerror(r) : "short write", r);
+    return r < 0 ? r : UVC_ERROR_IO;
+  }
+  if (!ack) return 0;
+  uint8_t response[TRACKER_MAX_CONTROL];
+  for (int waited = 0; waited < 1000; waited++) {
+    r = uvc_get_ctrl(usb->handle, usb->unit, 2, response, length, UVC_GET_CUR);
+    if (r < 0 || (size_t)r != length) {
+      fprintf(stderr, "vft-stream: XU GET_CUR: %s\n", r < 0 ? uvc_strerror(r) : "short read");
+      return r < 0 ? r : UVC_ERROR_IO;
+    }
+    if (response[0] == 0x56 && memcmp(command, response + 1, 16) == 0) return 0;
+    if (response[0] != 0x55) {
+      fprintf(stderr, "vft-stream: unexpected XU echo 0x%02x\n", response[0]);
+      return UVC_ERROR_IO;
+    }
+    msleep(1);
+  }
+  fprintf(stderr, "vft-stream: XU echo timed out\n");
+  return UVC_ERROR_TIMEOUT;
+}
+
+static void print_extensions(uvc_device_handle_t *handle) {
+  for (const uvc_extension_unit_t *unit = uvc_get_extension_units(handle); unit; unit = unit->next) {
+    fprintf(stderr, "vft-stream: XU unit=%u GUID(bytes)=", unit->bUnitID);
+    for (int i = 0; i < 16; i++) fprintf(stderr, "%02x", unit->guidExtensionCode[i]);
+    fprintf(stderr, " controls=0x%llx", (unsigned long long)unit->bmControls);
+    if (unit->bmControls & 2) fprintf(stderr, " selector2-length=%d", uvc_get_ctrl_len(handle, unit->bUnitID, 2));
+    fputc('\n', stderr);
+  }
+}
+
+static int select_control(uvc_device_handle_t *handle, int requested, struct usb_control *usb) {
+  /* UVC GUID bytes for {2ccb0bda-6331-4fdb-850e-79054dbd5671}. */
+  static const uint8_t guid[] = {0xda, 0x0b, 0xcb, 0x2c, 0x31, 0x63, 0xdb, 0x4f,
+                                0x85, 0x0e, 0x79, 0x05, 0x4d, 0xbd, 0x56, 0x71};
+  int unit_id = requested, count = 0;
+  if (!unit_id) {
+    for (const uvc_extension_unit_t *unit = uvc_get_extension_units(handle); unit; unit = unit->next)
+      if (!memcmp(unit->guidExtensionCode, guid, sizeof guid) && (unit->bmControls & 2)) {
+        unit_id = unit->bUnitID;
+        count++;
+      }
+    /* Retain the existing VFT's known unit ID. Focus 3 requires discovery
+     * or an explicit --xu-unit, rather than guessing an unrelated unit. */
+    if (!count && profile == TRACKER_VFT) unit_id = 4;
+    else if (count != 1) {
+      fprintf(stderr, "vft-stream: cannot uniquely select HTC XU; run --diagnose and specify --xu-unit\n");
+      return -1;
+    }
+  }
+  int length = uvc_get_ctrl_len(handle, unit_id, 2);
+  if (length < 17 || length > TRACKER_MAX_CONTROL ||
+      (profile == TRACKER_VFT && length != 64 && length != 384)) {
+    fprintf(stderr, "vft-stream: unsupported selector-2 length %d for XU %d\n", length, unit_id);
+    return -1;
+  }
+  usb->handle = handle;
+  usb->unit = unit_id;
+  fprintf(stderr, "vft-stream: using XU %d selector 2, %d-byte payload\n", unit_id, length);
+  return length;
+}
+
+/* -------------------------------------------------------------- http ---- */
+
+static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t cv = PTHREAD_COND_INITIALIZER;
+static uint8_t *frame;
+static size_t frame_len, frame_cap;
+static unsigned long frame_seq;
+
+static void jpg_sink(void *ctx, void *data, int size) {
+  (void)ctx;
+  if (frame_len + size > frame_cap) {
+    frame_cap = (frame_len + size) * 2;
+    frame = realloc(frame, frame_cap);
+  }
+  memcpy(frame + frame_len, data, size);
+  frame_len += size;
+}
+
+static int send_all(int fd, const void *p, size_t n) {
+  while (n) {
+    ssize_t w = send(fd, p, n, MSG_NOSIGNAL);
+    if (w <= 0) return -1;
+    p = (const char *)p + w, n -= w;
+  }
+  return 0;
+}
+
+static void *client(void *arg) {
+  int fd = (int)(intptr_t)arg;
+  char req[1024];
+  (void)!recv(fd, req, sizeof req, 0); // any path serves the stream
+
+  static const char hdr[] =
+      "HTTP/1.1 200 OK\r\n"
+      "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n"
+      "Cache-Control: no-cache\r\n"
+      "Connection: close\r\n\r\n";
+  uint8_t *buf = NULL;
+  size_t cap = 0;
+  unsigned long seen = 0;
+
+  if (send_all(fd, hdr, sizeof hdr - 1) == 0)
+    for (;;) {
+      pthread_mutex_lock(&mu);
+      while (frame_seq == seen && !stop) pthread_cond_wait(&cv, &mu);
+      if (stop) { pthread_mutex_unlock(&mu); break; }
+      seen = frame_seq;
+      size_t n = frame_len;
+      if (n > cap) buf = realloc(buf, cap = n);
+      memcpy(buf, frame, n);
+      pthread_mutex_unlock(&mu);
+
+      char part[128];
+      int pl = snprintf(part, sizeof part,
+                        "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %zu\r\n\r\n", n);
+      if (send_all(fd, part, pl) || send_all(fd, buf, n) || send_all(fd, "\r\n", 2)) break;
+    }
+
+  free(buf);
+  close(fd);
+  return NULL;
+}
+
+static int open_server(int port) {
+  int s = socket(AF_INET6, SOCK_STREAM, 0), one = 1, zero = 0;
+  if (s < 0) return -1;
+  setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+  setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, &zero, sizeof zero);
+  struct sockaddr_in6 a = {.sin6_family = AF_INET6, .sin6_port = htons(port), .sin6_addr = in6addr_any};
+  if (bind(s, (struct sockaddr *)&a, sizeof a) < 0 || listen(s, 8) < 0) {
+    int saved = errno;
+    close(s);
+    errno = saved;
+    return -1;
+  }
+  fprintf(stderr, "vft-stream: serving on http://0.0.0.0:%d/\n", port);
+  return s;
+}
+
+static void *server(void *arg) {
+  int s = (int)(intptr_t)arg, one = 1;
+
+  for (;;) {
+    int c = accept(s, NULL, NULL);
+    if (c < 0) { if (errno == EINTR && !stop) continue; break; }
+    setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+    pthread_t t;
+    if (pthread_create(&t, NULL, client, (void *)(intptr_t)c) == 0) pthread_detach(t);
+    else close(c);
+  }
+  return NULL;
+}
+
+/* ------------------------------------------------------------ stream ---- */
+
+static int raw, quality = 90;
+static pthread_mutex_t timing_mu = PTHREAD_MUTEX_INITIALIZER;
+static struct timespec last_frame;
+
+// Runs on libuvc's transfer thread, once per complete frame.
+static void on_frame(uvc_frame_t *f, void *user) {
+  (void)user;
+  static uint8_t img[IMAGE_MAX_PIXELS];
+  static unsigned long n;
+  static time_t last_log;
+
+  if (f->frame_format != UVC_FRAME_FORMAT_YUYV)
+    return; // short/corrupt transfer; the next one will do
+
+  int ow, oh;
+  if (image_process(profile, rotation, raw, f->data, f->data_bytes, f->width,
+                    f->height, f->step, img, sizeof img, &ow, &oh)) return;
+
+  pthread_mutex_lock(&mu);
+  frame_len = 0;
+  stbi_write_jpg_to_func(jpg_sink, NULL, ow, oh, 1, img, quality);
+  frame_seq++;
+  pthread_cond_broadcast(&cv);
+  pthread_mutex_unlock(&mu);
+
+  time_t now = time(NULL);
+  pthread_mutex_lock(&timing_mu);
+  clock_gettime(CLOCK_MONOTONIC, &last_frame);
+  pthread_mutex_unlock(&timing_mu);
+  if (!last_log) last_log = now;
+  n++;
+  if (now - last_log >= 10) {
+    fprintf(stderr, "vft-stream: %.1f fps\n", n / (double)(now - last_log));
+    n = 0, last_log = now;
+  }
+}
+
+// The tracker advertises its modes in its descriptors; take its first YUYV
+// frame size at its default interval instead of hardcoding 400x400@60.
+static int pick_mode(uvc_device_handle_t *h, uvc_stream_ctrl_t *ctrl) {
+  for (const uvc_format_desc_t *fmt = uvc_get_format_descs(h); fmt; fmt = fmt->next) {
+    if (fmt->bDescriptorSubtype != UVC_VS_FORMAT_UNCOMPRESSED ||
+        memcmp(fmt->fourccFormat, "YUY2", 4) != 0)
+      continue;
+    for (const uvc_frame_desc_t *fr = fmt->frame_descs; fr; fr = fr->next) {
+      if (!fr->wWidth || !fr->wHeight || (fr->wWidth & 1) ||
+          (size_t)fr->wWidth * fr->wHeight > IMAGE_MAX_PIXELS) continue;
+      int fps = fr->dwDefaultFrameInterval ? 10000000 / fr->dwDefaultFrameInterval : 0;
+      int r = uvc_get_stream_ctrl_format_size(h, ctrl, UVC_FRAME_FORMAT_YUYV, fr->wWidth,
+                                              fr->wHeight, fps);
+      if (r == 0) {
+        fprintf(stderr, "vft-stream: %ux%u YUYV @ %d fps\n", fr->wWidth, fr->wHeight, fps);
+        return 0;
+      }
+    }
+  }
+  fprintf(stderr, "vft-stream: no usable YUYV mode; descriptors follow\n");
+  uvc_print_diag(h, stderr);
+  return -1;
+}
+
+/* -------------------------------------------------------------- main ---- */
+
+static void usage(int status) {
+  fprintf(stderr,
+          "usage: vft-stream [-p port] [-q jpeg-quality] [-r] [options]\n"
+          "  -p  HTTP port (default 8085)\n"
+          "  -q  JPEG quality 1-100 (default 90)\n"
+          "  -r  raw: full Y frame without processing or rotation\n"
+          "  --tracker auto|vft|focus3  (default auto)\n"
+          "  --pid hex                select a specific HTC product ID\n"
+          "  --xu-unit 1-255          override the vendor extension unit\n"
+          "  --rotation 0|90|180|270   Focus 3 degrees CCW (default 90)\n"
+          "  --diagnose               print USB/UVC descriptors without activation\n");
+  exit(status);
+}
+
+static int parse_number(const char *text, int base, int low, int high) {
+  char *end;
+  errno = 0;
+  long value = strtol(text, &end, base);
+  if (errno || end == text || *end || value < low || value > high) usage(2);
+  return value;
+}
+
+int main(int argc, char **argv) {
+  int port = 8085, opt, r, pid = 0, xu_unit = 0, diagnose = 0;
+  enum tracker_profile requested = TRACKER_AUTO;
+  static const struct option options[] = {
+    {"tracker", required_argument, NULL, 't'}, {"pid", required_argument, NULL, 'i'},
+    {"xu-unit", required_argument, NULL, 'u'}, {"rotation", required_argument, NULL, 'R'},
+    {"diagnose", no_argument, NULL, 'd'}, {"help", no_argument, NULL, 'h'}, {NULL, 0, NULL, 0}
+  };
+  while ((opt = getopt_long(argc, argv, "p:q:rh", options, NULL)) != -1) switch (opt) {
+      case 'p': port = parse_number(optarg, 10, 1, 65535); break;
+      case 'q': quality = parse_number(optarg, 10, 1, 100); break;
+      case 'r': raw = 1; break;
+      case 't':
+        if (!strcmp(optarg, "auto")) requested = TRACKER_AUTO;
+        else if (!strcmp(optarg, "vft")) requested = TRACKER_VFT;
+        else if (!strcmp(optarg, "focus3")) requested = TRACKER_FOCUS3;
+        else usage(2);
+        break;
+      case 'i': pid = parse_number(optarg, 16, 1, 65535); break;
+      case 'u': xu_unit = parse_number(optarg, 10, 1, 255); break;
+      case 'R': rotation = parse_number(optarg, 10, 0, 270); if (rotation % 90) usage(2); break;
+      case 'd': diagnose = 1; break;
+      case 'h': usage(0); break;
+      default: usage(2);
+    }
+  if (optind != argc) usage(2);
+
+  struct sigaction sa = {.sa_handler = on_signal};
+  sigaction(SIGINT, &sa, NULL);
+  sigaction(SIGTERM, &sa, NULL);
+  image_init();
+
+  uvc_context_t *ctx = NULL;
+  uvc_device_t **devices = NULL, *dev = NULL;
+  uvc_device_handle_t *h = NULL;
+  struct usb_control usb = {0};
+  struct tracker_io io = {.context = &usb, .send = control_send, .sleep_ms = control_sleep};
+  int rc = 1, activation_attempted = 0, streaming = 0, server_fd = -1;
+  if ((r = uvc_init(&ctx, NULL)) < 0) uvc_die("uvc_init", r);
+  if ((r = uvc_get_device_list(ctx, &devices)) < 0) {
+    fprintf(stderr, "vft-stream: enumerate cameras: %s\n", uvc_strerror(r));
+    goto cleanup;
+  }
+  int matches = 0;
+  for (size_t i = 0; devices[i]; i++) {
+    uvc_device_descriptor_t *descriptor;
+    if (uvc_get_device_descriptor(devices[i], &descriptor) < 0) continue;
+    enum tracker_profile detected = tracker_identify(descriptor->idVendor, descriptor->idProduct);
+    if (descriptor->idVendor == HTC_VID)
+      fprintf(stderr, "vft-stream: HTC %04x:%04x %s (profile %s)\n", descriptor->idVendor,
+              descriptor->idProduct, descriptor->product ? descriptor->product : "(no product string)", tracker_name(detected));
+    int eligible = descriptor->idVendor == HTC_VID &&
+                   (!pid || descriptor->idProduct == pid) &&
+                   (requested == TRACKER_AUTO ? detected != TRACKER_AUTO :
+                    detected == requested || (pid && detected == TRACKER_AUTO));
+    if (diagnose && pid && descriptor->idVendor == HTC_VID && descriptor->idProduct == pid) eligible = 1;
+    if (eligible) {
+      matches++;
+      dev = devices[i];
+      profile = requested == TRACKER_AUTO ? detected : requested;
+    }
+    uvc_free_device_descriptor(descriptor);
+  }
+  if (matches != 1) {
+    fprintf(stderr, "vft-stream: %d matching cameras; use --tracker and --pid to select exactly one\n", matches);
+    goto cleanup;
+  }
+  if ((r = uvc_open(dev, &h)) < 0) {
+    // ACCESS here is usbfs permissions, not a missing tracker.
+    fprintf(stderr, "vft-stream: open tracker: %s%s\n", uvc_strerror(r),
+            r == UVC_ERROR_ACCESS ? " (run as root, or install-service.sh for the udev rule)" : "");
+    goto cleanup;
+  }
+  fprintf(stderr, "vft-stream: opened %s tracker\n", tracker_name(profile));
+  print_extensions(h);
+  if (diagnose) { uvc_print_diag(h, stderr); rc = 0; goto cleanup; }
+  r = select_control(h, xu_unit, &usb);
+  if (r < 0) goto cleanup;
+  io.length = r;
+
+  uvc_stream_ctrl_t ctrl;
+  if (pick_mode(h, &ctrl)) goto cleanup;
+  server_fd = open_server(port);
+  if (server_fd < 0) {
+    fprintf(stderr, "vft-stream: HTTP listen: %s\n", strerror(errno));
+    goto cleanup;
+  }
+  activation_attempted = 1;
+  if (tracker_set_state(profile, 1, &io)) goto cleanup;
+
+  pthread_t srv;
+  if ((r = pthread_create(&srv, NULL, server, (void *)(intptr_t)server_fd))) {
+    fprintf(stderr, "vft-stream: create HTTP server: %s\n", strerror(r));
+    goto cleanup;
+  }
+  pthread_detach(srv);
+
+  clock_gettime(CLOCK_MONOTONIC, &last_frame);
+  if ((r = uvc_start_streaming(h, &ctrl, on_frame, NULL, 0)) < 0) {
+    fprintf(stderr, "vft-stream: start streaming: %s\n", uvc_strerror(r));
+    goto cleanup;
+  }
+  streaming = 1;
+
+  rc = 0;
+  while (!stop) {
+    msleep(200);
+    // A stalled tracker (unplugged, or the XU state reset) never recovers by
+    // waiting; exit and let the service manager reinitialise it.
+    struct timespec now, previous;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    pthread_mutex_lock(&timing_mu);
+    previous = last_frame;
+    pthread_mutex_unlock(&timing_mu);
+    if (now.tv_sec - previous.tv_sec + (now.tv_nsec - previous.tv_nsec) / 1e9 > 3) {
+      fprintf(stderr, "vft-stream: no frame in 3s\n");
+      rc = 1;
+      break;
+    }
+  }
+
+cleanup:
+  if (streaming) uvc_stop_streaming(h);
+  if (activation_attempted && tracker_set_state(profile, 0, &io)) {
+    fprintf(stderr, "vft-stream: tracker shutdown failed (device may be disconnected)\n");
+    rc = 1;
+  }
+  pthread_mutex_lock(&mu);
+  stop = 1;
+  pthread_cond_broadcast(&cv);
+  pthread_mutex_unlock(&mu);
+  if (server_fd >= 0) { shutdown(server_fd, SHUT_RDWR); close(server_fd); }
+  if (h) uvc_close(h);
+  if (devices) uvc_free_device_list(devices, 1);
+  if (ctx) uvc_exit(ctx);
+  return rc;
+}

@@ -1,0 +1,10 @@
+# nix-build output links
+/result
+/result-*
+
+/vft-stream
+
+/diag.txt
+
+/dist
+/.build
