@@ -4,6 +4,8 @@ Activates a USB Vive Facial Tracker or Vive Focus 3 Facial Tracker and serves
 its camera as an MJPEG stream for Baballonia's Wireless/IP Camera input.
 The target is Steam Frame: capture uses libuvc/libusb from userspace and the
 Steam Frame build is a static ARM64 executable with no runtime packages to install.
+Focus 3 capture reads its bulk endpoint directly and assembles UVC payloads;
+the original VFT capture continues to use libuvc.
 
 This is an extension of jaerven-in-vr/vft-stream at commit `6678300`, using the
 Focus 3 activation protocol from Kirisame-Nanoha/Lip_Camera_IP_Server at
@@ -20,6 +22,10 @@ A Steam Frame descriptor report confirms Focus 3 extension unit 4 with GUID
 `2ccb0bda-6331-4fdb-850e-79054dbd5671`, selector 2, and **640×481 YUY2 at
 approximately 30 FPS over bulk USB**. The selector's payload length is queried
 at runtime; it is not the endpoint packet size. The extra row is retained.
+The reference selects the camera's reported YUY2 format rather than forcing
+640×480; its 320×480 setting is the resized network output. See the
+[reference review](docs/focus3-reference-review.md) for mode selection,
+activation-byte comparisons and capture differences.
 
 Automatic selection uses the exact supported VID/PID pairs. It rejects ambiguous
 or unknown devices. `--tracker focus3` selects the Focus 3 when both models are
@@ -63,6 +69,8 @@ Options:
 --rotation 0|90|180|270  Focus 3 rotation in degrees CCW (default 90)
 --startup-timeout 1–120 first usable frame deadline in seconds (default 10)
 --capture-first        Focus 3: queue USB capture before vendor activation
+--capture-backend auto|bulk|libuvc  default auto: Focus 3 bulk, VFT libuvc
+--allow-uvc-errors     inspect complete Focus 3 bulk frames carrying UVC ERR
 --probe-bulk           Focus 3: read raw USB transfers for diagnosis, then exit
 --diagnose              inspect descriptors without activating the tracker
 ```
@@ -71,23 +79,27 @@ If the camera is sideways or upside-down, stop it with Ctrl+C and try another
 `--rotation` value. `-r` exposes the complete 640×481 source image for comparison.
 The Focus 3 profile does not apply the older VFT's crop or gamma correction.
 Focus 3 capture commits the UVC mode before enabling the sensor and IR, then
-queues USB transfers without another mode commit. The first usable frame has a
+reads the bulk endpoint without another mode commit. Payloads are assembled
+using frame ID, timestamp and end-of-frame boundaries. Partial data returned
+with USB timeouts is retained; incomplete and error-marked frames are rejected.
+The first usable frame has a
 ten-second deadline; after capture begins, three seconds without a usable frame
 triggers shutdown. Ctrl+C/SIGTERM, activation failure, stream-start failure and
 the watchdog attempt to turn IR off and disable streaming before releasing USB.
 
 For troubleshooting, run `sudo sh diag.sh` next to the binary; it writes `diag.txt`.
 Startup prints negotiated frame/payload sizes and the first callback's dimensions,
-stride and byte count. A watchdog exit includes received, rejected and encoded
-frame counts. `received=0` means libuvc delivered no complete frame callbacks;
-nonzero `received` with `encoded=0` means callbacks reached image processing but
-no usable frame was produced. Short frames remain rejected rather than silently
-discarding the advertised extra row.
+stride and byte count. Direct capture also reports initial payload headers,
+assembled frame sizes, UVC ERR flags, and final byte/frame/error totals.
+The expected 640×481 frame contains 615680 bytes; 640×480 would contain 614400.
+Short frames remain rejected rather than silently discarding the advertised row.
+A watchdog exit includes received, rejected and encoded callback counts.
 
-Hardware tests of `v0.3.0-focus3.1` and `.2` reached capture startup but timed out
-without a usable frame. USB debug output from `.2` showed an empty bulk transfer
-followed by five-second transfer timeouts. `v0.3.0-focus3.3` adds two diagnostics
-for this failure; successful streaming on Steam Frame still needs testing.
+Hardware tests of the earlier libuvc backend stalled. The `.3` direct USB probe
+received three 32768-byte payloads, while libuvc delivered a 131024-byte partial
+frame. One observed payload carried UVC ERR. This establishes USB byte delivery,
+not a complete image or an incorrect mode. `v0.3.0-focus3.4` uses direct bulk
+capture by default for Focus 3; successful streaming still needs hardware testing.
 If capture stalls, share the complete application output from this command:
 
 ```sh
@@ -96,14 +108,29 @@ cat focus3-capture.log
 ```
 
 Try the alternative activation timing, which queues USB reads before sending the
-same sensor/IR commands. This is an experimental option; the default order remains
+same sensor/IR commands. The default order is
 commit, vendor activation, capture:
 
 ```sh
 sudo ./vft-stream --tracker focus3 --capture-first
 ```
 
-To isolate raw USB delivery from libuvc's frame parser and transfer queue:
+For comparison with the earlier libuvc capture path:
+
+```sh
+sudo ./vft-stream --tracker focus3 --capture-backend libuvc
+```
+
+If complete frames arrive but carry UVC ERR, inspect them with:
+
+```sh
+sudo ./vft-stream --tracker focus3 --allow-uvc-errors -r
+```
+
+This permits only full-size error-marked frames and does not establish their
+image quality. Incomplete frames are still rejected.
+
+To isolate raw USB delivery from frame assembly and image processing:
 
 ```sh
 sudo ./vft-stream --tracker focus3 --probe-bulk --startup-timeout 5
@@ -191,7 +218,7 @@ Version tags beginning with `v` run `.github/workflows/release.yml`. The workflo
 builds native and static ARM64 binaries, runs the regression/sanitizer/integration
 checks, and publishes a hardware-test prerelease with the ARM64 executable,
 complete Steam Frame package and checksums. The current release is
-`v0.3.0-focus3.3`. The same workflow can be started manually with an existing
+`v0.3.0-focus3.4`. The same workflow can be started manually with an existing
 version tag if needed. Physical hardware validation remains required.
 
 ## Tests and validation status
@@ -201,6 +228,7 @@ sh tests/run.sh
 SANITIZE=1 sh tests/run.sh
 sh scripts/build.sh native
 sh tests/integration.sh
+SANITIZE=1 sh tests/integration.sh
 ```
 
 Integration tests install Pillow 11.3.0 into the tools cache, simulate USB delivery,
@@ -208,7 +236,9 @@ and exercise the real capture callback, JPEG encoder, HTTP server and cleanup.
 They verify decoded JPEG dimensions/pixels, reconnection, diagnostics without
 activation, device rejection, commit-before-activation ordering, startup failures,
 busy ports, delayed first frames, rejected frames, stalled capture, capture-before-
-activation cleanup and direct bulk reads with partial timeouts and USB errors.
+activation cleanup and direct bulk capture with partial timeouts and USB errors.
+Decoder tests cover the observed 12-byte headers, frame boundaries, recovery
+after partial/error frames, malformed headers, overflow and strict frame sizes.
 Protocol tests check exact payloads, padding, delays, acknowledgement behavior and
 shutdown after a failed write. Image tests cover all rotations, raw frames, padded
 stride, invalid buffers, area scaling and the reported odd-height mode. A fixture

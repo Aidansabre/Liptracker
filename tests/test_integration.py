@@ -16,7 +16,7 @@ binary = sys.argv.pop(1)
 
 
 class Integration(unittest.TestCase):
-    def run_camera(self, mode="", options=()):
+    def run_camera(self, mode="", options=(), backend="libuvc"):
         log = Path(self.directory.name) / "usb.log"
         log.write_text("")
         events = log.with_suffix(".events")
@@ -26,7 +26,8 @@ class Integration(unittest.TestCase):
             port = sock.getsockname()[1]
         environment = dict(os.environ, VFT_TEST_MODE=mode, VFT_TEST_LOG=str(log),
                            VFT_TEST_EVENTS=str(events))
-        process = subprocess.Popen([binary, "-p", str(port), *options], env=environment,
+        selection = ["--capture-backend", backend] if backend else []
+        process = subprocess.Popen([binary, "-p", str(port), *selection, *options], env=environment,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.addCleanup(self.stop, process)
         return process, port, log
@@ -194,7 +195,7 @@ class Integration(unittest.TestCase):
     def test_bulk_probe_errors_and_empty_capture(self):
         for mode, message in (("probe-empty", b"bytes=0 timeouts="),
                               ("probe-pipe", b"LIBUSB_ERROR_PIPE"),
-                              ("probe-descriptor-failure", b"bulk probe descriptors:"),
+                              ("probe-descriptor-failure", b"bulk descriptors:"),
                               ("probe-invalid-endpoint", b"requires one bulk IN endpoint")):
             with self.subTest(mode=mode):
                 process, _, log = self.run_camera(mode, options=("--probe-bulk", "--startup-timeout", "1"))
@@ -228,6 +229,66 @@ class Integration(unittest.TestCase):
                 else:
                     self.check_shutdown(log)
                     self.assertEqual(events[-4:], ["stop", "ir-off", "stream-off", "close"])
+
+    def test_default_bulk_mjpeg_and_partial_recovery(self):
+        for mode in ("", "bulk-partial-timeout", "bulk-first-short", "bulk-error-recovery"):
+            with self.subTest(mode=mode):
+                process, port, log = self.run_camera(mode, backend=None)
+                self.assertEqual(self.jpeg(process, port).size, (320, 480))
+                process.send_signal(signal.SIGTERM)
+                _, stderr = process.communicate(timeout=5)
+                self.assertEqual(process.returncode, 0, stderr.decode())
+                self.assertIn(b"direct bulk capture endpoint=0x81", stderr)
+                self.assertIn(b"first callback: 640x481", stderr)
+                self.assertIn(b"bytes=615680 expected=615680", stderr)
+                if mode == "bulk-first-short":
+                    self.assertIn(b"bulk frame: bytes=131024 expected=615680", stderr)
+                if mode == "bulk-partial-timeout":
+                    self.assertIn(b"timeouts=1", stderr)
+                self.check_shutdown(log)
+
+    def test_bulk_incomplete_and_error_frames(self):
+        for mode in ("bulk-incomplete", "bulk-error", "bulk-empty", "bulk-read-error"):
+            with self.subTest(mode=mode):
+                process, _, log = self.run_camera(mode, options=("--startup-timeout", "1"), backend=None)
+                _, stderr = process.communicate(timeout=5)
+                self.assertEqual(process.returncode, 1, stderr.decode())
+                self.assertIn(b"encoded=0", stderr)
+                self.assertIn(b"delivered=0", stderr)
+                if mode == "bulk-incomplete":
+                    self.assertIn(b"max-frame=614400 expected=615680", stderr)
+                if mode == "bulk-error":
+                    self.assertIn(b"error=1 incomplete=0", stderr)
+                self.check_shutdown(log)
+
+    def test_bulk_error_inspection_and_raw_image(self):
+        process, port, log = self.run_camera("bulk-error", options=("--allow-uvc-errors", "-r"), backend=None)
+        self.assertEqual(self.jpeg(process, port).size, (640, 481))
+        process.send_signal(signal.SIGTERM)
+        _, stderr = process.communicate(timeout=5)
+        self.assertEqual(process.returncode, 0, stderr.decode())
+        self.assertIn(b"allowing UVC ERR", stderr)
+        self.check_shutdown(log)
+
+    def test_bulk_capture_first_and_stall_cleanup(self):
+        process, port, log = self.run_camera("capture-first-required", options=("--capture-first",), backend=None)
+        self.assertEqual(self.jpeg(process, port).size, (320, 480))
+        process.send_signal(signal.SIGTERM)
+        _, stderr = process.communicate(timeout=5)
+        self.assertEqual(process.returncode, 0, stderr.decode())
+        self.check_shutdown(log)
+        process, _, log = self.run_camera("bulk-stall", backend=None)
+        _, stderr = process.communicate(timeout=7)
+        self.assertEqual(process.returncode, 1, stderr.decode())
+        self.assertIn(b"no frame in 3s", stderr)
+        self.check_shutdown(log)
+
+    def test_bulk_setup_failure_does_not_activate(self):
+        process, _, log = self.run_camera("probe-descriptor-failure", backend=None)
+        _, stderr = process.communicate(timeout=5)
+        self.assertEqual(process.returncode, 1, stderr.decode())
+        self.assertIn(b"prepare bulk capture", stderr)
+        self.assertEqual(log.read_text(), "")
 
     def test_stall_cleanup(self):
         process, _, log = self.run_camera("stall")

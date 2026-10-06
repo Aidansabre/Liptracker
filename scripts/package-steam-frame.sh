@@ -8,7 +8,8 @@ mkdir -p "$stage/vft-stream-focus3/source"
 cp "$repo/dist/vft-stream-steam-frame" "$stage/vft-stream-focus3/vft-stream"
 cp "$repo/diag.sh" "$repo/install-service.sh" "$repo/README.md" "$repo/LICENSE" "$repo/THIRD_PARTY_NOTICES.md" "$stage/vft-stream-focus3/"
 cp -R "$repo/licenses" "$stage/vft-stream-focus3/"
-for item in vft-stream.c tracker.c tracker.h image.c image.h package.nix default.nix scripts tests; do
+cp -R "$repo/docs" "$stage/vft-stream-focus3/"
+for item in vft-stream.c tracker.c tracker.h image.c image.h bulk_capture.c bulk_capture.h uvc_bulk.c uvc_bulk.h package.nix default.nix scripts tests docs; do
   cp -R "$repo/$item" "$stage/vft-stream-focus3/source/"
 done
 cp "$repo/LICENSE" "$repo/THIRD_PARTY_NOTICES.md" "$repo/README.md" "$stage/vft-stream-focus3/source/"

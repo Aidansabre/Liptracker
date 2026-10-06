@@ -36,13 +36,15 @@ jobs:
       - name: Build native dependencies and binary
         run: sh scripts/build.sh native
 
-      - name: Run protocol and image regression tests
+      - name: Run protocol, image and UVC payload tests
         run: |
           sh tests/run.sh
           SANITIZE=1 sh tests/run.sh
 
       - name: Test MJPEG and cleanup with simulated USB
-        run: sh tests/integration.sh
+        run: |
+          sh tests/integration.sh
+          SANITIZE=1 sh tests/integration.sh
 
       - name: Build the static ARM64 binary and package
         run: |

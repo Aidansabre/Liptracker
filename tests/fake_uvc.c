@@ -24,6 +24,7 @@ static struct uvc_device_handle handle;
 static struct uvc_stream_handle stream;
 static atomic_int sensor_on, ir_on;
 static atomic_int running;
+static atomic_int bulk_read_started;
 static pthread_t thread;
 static uvc_frame_callback_t *callback;
 static void *callback_context;
@@ -89,10 +90,50 @@ const char *libusb_error_name(int error) {
   if (error == LIBUSB_ERROR_PIPE) return "LIBUSB_ERROR_PIPE";
   return "LIBUSB_ERROR_IO";
 }
+static int capture_transfer(unsigned char *data, int length, int *got, unsigned timeout) {
+  static uint8_t payload[16384];
+  static size_t payload_size, payload_at, frame_at;
+  static uint32_t frame_number;
+  static int partial_injected;
+  atomic_store(&bulk_read_started, 1);
+  *got = 0;
+  for (unsigned waited = 0; (!sensor_on || !ir_on) && waited < timeout; waited += 5) usleep(5000);
+  if (!sensor_on || !ir_on) return LIBUSB_ERROR_TIMEOUT;
+  if (mode("bulk-empty") || (mode("bulk-stall") && frame_number)) {
+    usleep(timeout * 1000); return LIBUSB_ERROR_TIMEOUT;
+  }
+  if (mode("bulk-read-error")) return LIBUSB_ERROR_IO;
+  if (payload_at == payload_size) {
+    size_t frame_size = mode("bulk-incomplete") ? 640*480*2 : 640*481*2;
+    if (mode("bulk-first-short") && !frame_number) frame_size = 131024;
+    size_t count = frame_size - frame_at;
+    if (count > sizeof payload - 12) count = sizeof payload - 12;
+    memset(payload, 0, 12);
+    payload[0] = 12;
+    payload[1] = 0x0c | (frame_number & 1) | (frame_at+count == frame_size ? 2 : 0);
+    if (mode("bulk-error") || (mode("bulk-error-recovery") && !frame_number)) payload[1] |= 0x40;
+    for (int i = 0; i < 4; i++) payload[2+i] = (frame_number + 1) >> (8*i);
+    for (size_t i = 0; i < count; i++) payload[12+i] = ((frame_at+i) & 1) ? 255 : 64;
+    payload_size = count+12; payload_at = 0;
+    frame_at += count;
+    if (frame_at == frame_size) { frame_at = 0; frame_number++; }
+  }
+  size_t count = payload_size-payload_at;
+  if (count > (size_t)length) count = length;
+  int partial = mode("bulk-partial-timeout") && !partial_injected;
+  if (partial) { count = 1000; partial_injected = 1; }
+  memcpy(data, payload+payload_at, count);
+  payload_at += count;
+  *got = count;
+  usleep(500);
+  return partial ? LIBUSB_ERROR_TIMEOUT : LIBUSB_SUCCESS;
+}
 int libusb_bulk_transfer(libusb_device_handle *dev, unsigned char endpoint,
                         unsigned char *data, int length, int *got, unsigned int timeout) {
-  assert(dev == &usb_handle && endpoint == 0x81 && length == 16384 && timeout && timeout <= 1000);
-  assert(stream.open && !stream.started && sensor_on && ir_on);
+  assert(dev == &usb_handle && endpoint == 0x81 && length > 0 && length <= 16384 && timeout && timeout <= 1000);
+  assert(stream.open && !stream.started);
+  if (timeout == 250) return capture_transfer(data, length, got, timeout);
+  assert(sensor_on && ir_on);
   event("bulk-read");
   *got = 0;
   if (mode("probe-pipe")) return LIBUSB_ERROR_PIPE;
@@ -119,7 +160,7 @@ int uvc_set_ctrl(uvc_device_handle_t *dev, uint8_t unit, uint8_t selector, void 
   if (log) { for (int i = 0; i < length; i++) fprintf(log, "%02x", bytes[i]); fputc('\n', log); fclose(log); }
   assert(stream.open); /* Vendor writes must follow the stream commit. */
   if (bytes[1] == 0x14) {
-    if (bytes[3] == 1 && mode("capture-first-required") && !stream.started) return UVC_ERROR_IO;
+    if (bytes[3] == 1 && mode("capture-first-required") && !stream.started && !bulk_read_started) return UVC_ERROR_IO;
     sensor_on = bytes[3] == 1;
     event(sensor_on ? "stream-on" : "stream-off");
   } else if (bytes[1] == 0xa2) {
