@@ -174,6 +174,61 @@ class Integration(unittest.TestCase):
         self.assertEqual(process.returncode, 0, stderr.decode())
         self.check_shutdown(log)
 
+    def test_bulk_probe_data_and_partial_timeout(self):
+        for mode in ("", "probe-partial"):
+            with self.subTest(mode=mode):
+                process, _, log = self.run_camera(mode, options=("--probe-bulk",))
+                _, stderr = process.communicate(timeout=5)
+                self.assertEqual(process.returncode, 0, stderr.decode())
+                self.assertIn(b"bulk probe endpoint=0x81 read-size=16384", stderr)
+                self.assertIn(b"prefix=0c82", stderr)
+                expected_bytes = b"1536" if mode == "probe-partial" else b"49152"
+                self.assertIn(b"bulk probe summary: reads=3 bytes=" + expected_bytes, stderr)
+                self.assertNotIn(b"serving on", stderr)
+                self.assertNotIn(b"first callback:", stderr)
+                self.check_shutdown(log)
+                self.assertEqual(log.with_suffix(".events").read_text().splitlines(),
+                                 ["commit", "stream-off", "stream-on", "ir-on",
+                                  "bulk-read", "bulk-read", "bulk-read", "ir-off", "stream-off", "close"])
+
+    def test_bulk_probe_errors_and_empty_capture(self):
+        for mode, message in (("probe-empty", b"bytes=0 timeouts="),
+                              ("probe-pipe", b"LIBUSB_ERROR_PIPE"),
+                              ("probe-descriptor-failure", b"bulk probe descriptors:"),
+                              ("probe-invalid-endpoint", b"requires one bulk IN endpoint")):
+            with self.subTest(mode=mode):
+                process, _, log = self.run_camera(mode, options=("--probe-bulk", "--startup-timeout", "1"))
+                _, stderr = process.communicate(timeout=5)
+                self.assertEqual(process.returncode, 1, stderr.decode())
+                self.assertIn(message, stderr)
+                self.check_shutdown(log)
+                self.assertEqual(log.with_suffix(".events").read_text().splitlines()[-1], "close")
+
+    def test_capture_first_mjpeg_and_cleanup(self):
+        process, port, log = self.run_camera("capture-first-required", options=("--capture-first",))
+        self.assertEqual(self.jpeg(process, port).size, (320, 480))
+        process.send_signal(signal.SIGTERM)
+        _, stderr = process.communicate(timeout=5)
+        self.assertEqual(process.returncode, 0, stderr.decode())
+        self.assertIn(b"USB capture queued before Focus 3 activation", stderr)
+        self.check_shutdown(log)
+        self.assertEqual(log.with_suffix(".events").read_text().splitlines(),
+                         ["commit", "start", "stream-off", "stream-on", "ir-on", "stop", "ir-off", "stream-off", "close"])
+
+    def test_capture_first_failure_cleanup(self):
+        for mode in ("start-failure", "control-failure"):
+            with self.subTest(mode=mode):
+                process, _, log = self.run_camera(mode, options=("--capture-first",))
+                _, stderr = process.communicate(timeout=5)
+                self.assertEqual(process.returncode, 1, stderr.decode())
+                events = log.with_suffix(".events").read_text().splitlines()
+                if mode == "start-failure":
+                    self.assertEqual(log.read_text(), "")
+                    self.assertEqual(events, ["commit", "start", "close"])
+                else:
+                    self.check_shutdown(log)
+                    self.assertEqual(events[-4:], ["stop", "ir-off", "stream-off", "close"])
+
     def test_stall_cleanup(self):
         process, _, log = self.run_camera("stall")
         _, stderr = process.communicate(timeout=7)

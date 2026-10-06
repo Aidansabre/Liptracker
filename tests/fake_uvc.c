@@ -1,5 +1,6 @@
 /* Test-only USB backend. Exercises the real application and HTTP server. */
 #define _DEFAULT_SOURCE
+#include <libusb.h>
 #include <libuvc/libuvc.h>
 #include <assert.h>
 #include <pthread.h>
@@ -13,11 +14,15 @@ struct uvc_context { int unused; };
 struct uvc_device { int unused; };
 struct uvc_device_handle { int unused; };
 struct uvc_stream_handle { int open, started; };
+struct libusb_device { int unused; };
+struct libusb_device_handle { int unused; };
+static struct libusb_device usb_device;
+static struct libusb_device_handle usb_handle;
 static struct uvc_context context;
 static struct uvc_device devices[2];
 static struct uvc_device_handle handle;
 static struct uvc_stream_handle stream;
-static int sensor_on, ir_on;
+static atomic_int sensor_on, ir_on;
 static atomic_int running;
 static pthread_t thread;
 static uvc_frame_callback_t *callback;
@@ -56,6 +61,47 @@ void uvc_close(uvc_device_handle_t *dev) {
   assert(dev == &handle && !stream.open && !stream.started);
 }
 const char *uvc_strerror(uvc_error_t error) { (void)error; return "fake USB error"; }
+libusb_device_handle *uvc_get_libusb_handle(uvc_device_handle_t *dev) {
+  assert(dev == &handle); return &usb_handle;
+}
+libusb_device *libusb_get_device(libusb_device_handle *dev) {
+  assert(dev == &usb_handle); return &usb_device;
+}
+int libusb_get_active_config_descriptor(libusb_device *dev, struct libusb_config_descriptor **out) {
+  assert(dev == &usb_device);
+  if (mode("probe-descriptor-failure")) return LIBUSB_ERROR_IO;
+  static struct libusb_endpoint_descriptor ep;
+  static struct libusb_interface_descriptor alt;
+  static struct libusb_interface interface;
+  ep = (struct libusb_endpoint_descriptor){.bEndpointAddress = 0x81,
+          .bmAttributes = mode("probe-invalid-endpoint") ? LIBUSB_TRANSFER_TYPE_INTERRUPT : LIBUSB_TRANSFER_TYPE_BULK};
+  alt = (struct libusb_interface_descriptor){.bInterfaceNumber = 1, .bNumEndpoints = 1, .endpoint = &ep};
+  interface = (struct libusb_interface){.altsetting = &alt, .num_altsetting = 1};
+  *out = calloc(1, sizeof **out); assert(*out);
+  (*out)->bNumInterfaces = 1;
+  (*out)->interface = &interface;
+  return LIBUSB_SUCCESS;
+}
+void libusb_free_config_descriptor(struct libusb_config_descriptor *config) { free(config); }
+const char *libusb_error_name(int error) {
+  if (!error) return "LIBUSB_SUCCESS";
+  if (error == LIBUSB_ERROR_TIMEOUT) return "LIBUSB_ERROR_TIMEOUT";
+  if (error == LIBUSB_ERROR_PIPE) return "LIBUSB_ERROR_PIPE";
+  return "LIBUSB_ERROR_IO";
+}
+int libusb_bulk_transfer(libusb_device_handle *dev, unsigned char endpoint,
+                        unsigned char *data, int length, int *got, unsigned int timeout) {
+  assert(dev == &usb_handle && endpoint == 0x81 && length == 16384 && timeout && timeout <= 1000);
+  assert(stream.open && !stream.started && sensor_on && ir_on);
+  event("bulk-read");
+  *got = 0;
+  if (mode("probe-pipe")) return LIBUSB_ERROR_PIPE;
+  if (mode("probe-empty")) { usleep(timeout * 1000); return LIBUSB_ERROR_TIMEOUT; }
+  memset(data, 0, length);
+  data[0] = 12; data[1] = 0x82;
+  *got = mode("probe-partial") ? 512 : length;
+  return mode("probe-partial") ? LIBUSB_ERROR_TIMEOUT : LIBUSB_SUCCESS;
+}
 const uvc_extension_unit_t *uvc_get_extension_units(uvc_device_handle_t *dev) {
   (void)dev;
   static uvc_extension_unit_t unit = {.bUnitID = 4, .bmControls = 3,
@@ -73,6 +119,7 @@ int uvc_set_ctrl(uvc_device_handle_t *dev, uint8_t unit, uint8_t selector, void 
   if (log) { for (int i = 0; i < length; i++) fprintf(log, "%02x", bytes[i]); fputc('\n', log); fclose(log); }
   assert(stream.open); /* Vendor writes must follow the stream commit. */
   if (bytes[1] == 0x14) {
+    if (bytes[3] == 1 && mode("capture-first-required") && !stream.started) return UVC_ERROR_IO;
     sensor_on = bytes[3] == 1;
     event(sensor_on ? "stream-on" : "stream-off");
   } else if (bytes[1] == 0xa2) {
@@ -116,7 +163,7 @@ static void *frames(void *arg) {
   if (mode("rejected-frames")) frame.data_bytes -= 1280;
   int count = 0;
   while (atomic_load(&running)) {
-    if (!mode("no-callbacks") && (!mode("delayed-start") || count >= 105) &&
+    if (sensor_on && ir_on && !mode("no-callbacks") && (!mode("delayed-start") || count >= 105) &&
         (!mode("stall") || !count)) callback(&frame, callback_context);
     count++;
     usleep(33333);
@@ -139,7 +186,6 @@ uvc_error_t uvc_stream_start(uvc_stream_handle_t *capture, uvc_frame_callback_t 
   (void)flags;
   assert(capture == &stream && stream.open && !stream.started);
   event("start");
-  if (!sensor_on || !ir_on) return UVC_ERROR_IO;
   if (mode("start-failure")) return UVC_ERROR_IO;
   callback = cb; callback_context = user; atomic_store(&running, 1);
   if (pthread_create(&thread, NULL, frames, NULL)) {

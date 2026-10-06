@@ -1,52 +1,49 @@
-Focus 3 capture startup update for Steam Frame.
+Focus 3 bulk-capture diagnostics for Steam Frame.
 
-The first hardware test of `v0.3.0-focus3.1` opened the tracker and completed
-vendor writes, but exited without a usable frame. This update commits the UVC
-capture mode **before** sensor/IR activation, then starts transfers without
-another mode commit. This ordering change still needs validation on the tracker.
+Hardware tests of `.1` and `.2` timed out without usable frames. The latest
+USB log shows a zero-byte bulk completion followed by five-second transfer
+timeouts. This release provides two ways to investigate that failure:
 
-- Initializes the UVC control block before negotiation.
-- Allows ten seconds for the first usable frame; retains the three-second
-  watchdog after capture begins. Use `--startup-timeout 1–120` to adjust startup.
-- Logs negotiated UVC frame/payload sizes and the first callback's geometry,
-  stride and byte count.
-- Reports received/rejected/encoded counts on timeout to distinguish missing
-  callbacks from rejected image data.
+- `--capture-first` queues USB capture before sending the existing Focus 3
+  sensor/IR activation sequence. This is an experimental startup option;
+  default activation timing is unchanged.
+- `--probe-bulk` reads the negotiated bulk endpoint directly, one transfer at
+  a time, without libuvc frame parsing or MJPEG output. It reports statuses,
+  byte counts, transfer prefixes and partial data returned with timeouts.
 
-Focus 3 support uses `0bb4:06a1`, the reported 640×481 YUY2 bulk mode and
-SET_CUR-only activation. Output is a rotated 320×480 luminance MJPEG stream.
-Raw/rotation options, descriptor diagnostics, shutdown cleanup and the optional
-service installer are included. Original VFT image processing is preserved.
+Both options print actual vendor command prefixes and shut down IR/stream
+state when finished.
 
-Download `vft-stream-focus3-steam-frame.tar.gz` for the binary, helper scripts,
-full application source and license notices. The standalone
-`vft-stream-steam-frame` executable is static ARM64/musl. `SHA256SUMS` verifies
-both downloads.
+Download `vft-stream-focus3-steam-frame.tar.gz` for the static ARM64 executable,
+helper scripts, complete application source and licenses. `SHA256SUMS` verifies
+the package and standalone executable.
+
+Extract the package and try capture with the alternative timing:
 
 ```sh
 tar -xzf vft-stream-focus3-steam-frame.tar.gz
 cd vft-stream-focus3
-sudo ./vft-stream --tracker focus3 --diagnose
-sudo ./vft-stream --tracker focus3
-```
-
-Point Baballonia's Wireless/IP Camera input at `http://<Steam-Frame-IP>:8085/`.
-Use `--rotation 0|90|180|270` if needed, or `-r` to inspect the full raw frame.
-
-If capture still fails, paste the complete application output, including the
-negotiated UVC values and timeout counters:
-
-```sh
-sudo ./vft-stream --tracker focus3 2>focus3-capture.log
+sudo ./vft-stream --tracker focus3 --capture-first 2>focus3-capture.log
 cat focus3-capture.log
 ```
 
-The release workflow builds both native and static ARM64 binaries, runs the
-protocol/image tests and sanitizer checks, and runs ten simulated USB/HTTP
-integration tests. These include commit/activation ordering, delayed startup,
-missing callbacks, short frames and failure cleanup. The original VFT image
-fixture matches upstream byte for byte.
+If it still stalls, collect direct USB-read results:
 
-This is a **prerelease for hardware testing**. Physical USB transfers, IR
-operation, orientation, sustained FPS, Baballonia tracking quality and service
-plug/unplug behavior still require validation on Steam Frame.
+```sh
+sudo ./vft-stream --tracker focus3 --probe-bulk --startup-timeout 5 2>focus3-bulk.log
+cat focus3-bulk.log
+```
+
+The probe exits after three nonempty reads or its deadline. A zero exit status
+only establishes that USB bytes arrived; it does not establish image decoding.
+The two options cannot be combined. Stop other camera processes before testing.
+
+GitHub Actions builds native and static ARM64 binaries, runs protocol/image
+regressions and sanitizer checks, and runs fourteen simulated USB/HTTP
+integration tests. These cover capture ordering, failure cleanup, direct bulk
+reads, partial timeouts and missing data. Original VFT image output matches
+the upstream fixture byte for byte.
+
+This is a **hardware-test prerelease**. Successful camera streaming on Steam
+Frame remains unverified. IR operation, orientation, sustained FPS, Baballonia
+tracking quality and service plug/unplug behavior also need hardware validation.

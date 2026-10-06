@@ -18,11 +18,9 @@
 // Runs on whatever the tracker is plugged into (the Steam Frame) so Baballonia
 // can consume it elsewhere as a "Wireless/IP Camera" (http://host:port/).
 //
-// The tracker is driven from userspace through libuvc/libusb rather than the
-// kernel's uvcvideo: the Steam Frame's kernel ships no uvcvideo at all, so the
-// tracker's interfaces sit unbound and there is no /dev/video node to open.
-// The flip side is that it needs usbfs access — root, or the udev rule
-// install-service.sh writes.
+// The tracker is driven from userspace through libuvc/libusb. A kernel
+// uvcvideo driver and /dev/video node are not required. Capture needs usbfs
+// access — root, or the udev rule install-service.sh writes.
 //
 // Baballonia applies the image pipeline only on its own VFT capture path, not
 // to IP cameras, so it has to happen here or the model sees a raw stereo
@@ -31,6 +29,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <getopt.h>
+#include <libusb.h>
 #include <libuvc/libuvc.h>
 #include <math.h>
 #include <netinet/in.h>
@@ -65,7 +64,7 @@ static void msleep(int ms) {
   nanosleep(&ts, NULL);
 }
 
-struct usb_control { uvc_device_handle_t *handle; uint8_t unit; };
+struct usb_control { uvc_device_handle_t *handle; uint8_t unit; int trace; };
 static enum tracker_profile profile = TRACKER_AUTO;
 static int rotation = 90;
 
@@ -81,6 +80,11 @@ static int control_send(void *context, const uint8_t *command, size_t length, in
     fprintf(stderr, "vft-stream: XU %u SET_CUR: %s (%d bytes)\n", usb->unit,
             r < 0 ? uvc_strerror(r) : "short write", r);
     return r < 0 ? r : UVC_ERROR_IO;
+  }
+  if (usb->trace) {
+    fprintf(stderr, "vft-stream: XU %u SET_CUR sent %d bytes prefix=", usb->unit, r);
+    for (size_t i = 0; i < length && i < 17; i++) fprintf(stderr, "%02x", command[i]);
+    fputc('\n', stderr);
   }
   if (!ack) return 0;
   uint8_t response[TRACKER_MAX_CONTROL];
@@ -314,6 +318,79 @@ static int pick_mode(uvc_device_handle_t *h, uvc_stream_ctrl_t *ctrl) {
   return -1;
 }
 
+/* Read the negotiated bulk endpoint directly, without libuvc's frame parser.
+ * The stream is committed and activated, but no competing capture transfers
+ * may be queued while this diagnostic runs. */
+static int probe_bulk(uvc_device_handle_t *h, const uvc_stream_ctrl_t *ctrl, int seconds) {
+  libusb_device_handle *usb = uvc_get_libusb_handle(h);
+  struct libusb_config_descriptor *config = NULL;
+  int r = libusb_get_active_config_descriptor(libusb_get_device(usb), &config);
+  if (r < 0) {
+    fprintf(stderr, "vft-stream: bulk probe descriptors: %s\n", libusb_error_name(r));
+    return 1;
+  }
+  uint8_t endpoint = 0;
+  int matches = 0;
+  for (int i = 0; i < config->bNumInterfaces; i++) {
+    const struct libusb_interface *interface = &config->interface[i];
+    for (int j = 0; j < interface->num_altsetting; j++) {
+      const struct libusb_interface_descriptor *alt = &interface->altsetting[j];
+      if (alt->bInterfaceNumber != ctrl->bInterfaceNumber || alt->bAlternateSetting != 0)
+        continue;
+      for (int k = 0; k < alt->bNumEndpoints; k++) {
+        const struct libusb_endpoint_descriptor *ep = &alt->endpoint[k];
+        if ((ep->bEndpointAddress & LIBUSB_ENDPOINT_DIR_MASK) == LIBUSB_ENDPOINT_IN &&
+            (ep->bmAttributes & LIBUSB_TRANSFER_TYPE_MASK) == LIBUSB_TRANSFER_TYPE_BULK) {
+          endpoint = ep->bEndpointAddress;
+          matches++;
+        }
+      }
+    }
+  }
+  libusb_free_config_descriptor(config);
+  if (matches != 1 || !ctrl->dwMaxPayloadTransferSize || ctrl->dwMaxPayloadTransferSize > 1024 * 1024) {
+    fprintf(stderr, "vft-stream: bulk probe requires one bulk IN endpoint and a 1-1048576 byte payload\n");
+    return 1;
+  }
+  int length = ctrl->dwMaxPayloadTransferSize;
+  uint8_t *data = malloc(length);
+  if (!data) { fprintf(stderr, "vft-stream: bulk probe allocation failed\n"); return 1; }
+  fprintf(stderr, "vft-stream: bulk probe endpoint=0x%02x read-size=%d deadline=%ds (no frame parser)\n",
+          endpoint, length, seconds);
+  unsigned reads = 0, nonempty = 0, timeouts = 0;
+  size_t bytes = 0;
+  int fatal = 0;
+  struct timespec begin, now;
+  clock_gettime(CLOCK_MONOTONIC, &begin);
+  while (!stop && nonempty < 3) {
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    double remaining = seconds - (now.tv_sec - begin.tv_sec + (now.tv_nsec - begin.tv_nsec) / 1e9);
+    if (remaining <= 0) break;
+    unsigned timeout = remaining >= 1 ? 1000 : (unsigned)(remaining * 1000) + 1;
+    int got = 0;
+    r = libusb_bulk_transfer(usb, endpoint, data, length, &got, timeout);
+    reads++;
+    if (r == LIBUSB_ERROR_TIMEOUT) timeouts++;
+    int report = reads <= 3 || got > 0 || (r && r != LIBUSB_ERROR_TIMEOUT);
+    if (report)
+      fprintf(stderr, "vft-stream: bulk read %u: %s (%d) bytes=%d", reads, libusb_error_name(r), r, got);
+    if (got > 0 && got <= length) {
+      bytes += got;
+      nonempty++;
+      if (report) {
+        fprintf(stderr, " prefix=");
+        for (int i = 0; i < got && i < 16; i++) fprintf(stderr, "%02x", data[i]);
+      }
+    }
+    if (report) fputc('\n', stderr);
+    if (r && r != LIBUSB_ERROR_TIMEOUT) { fatal = 1; break; }
+    if (!r && !got) msleep(20); /* Avoid spinning on repeated empty packets. */
+  }
+  free(data);
+  fprintf(stderr, "vft-stream: bulk probe summary: reads=%u bytes=%zu timeouts=%u\n", reads, bytes, timeouts);
+  return fatal || !bytes;
+}
+
 /* -------------------------------------------------------------- main ---- */
 
 static void usage(int status) {
@@ -327,6 +404,8 @@ static void usage(int status) {
           "  --xu-unit 1-255          override the vendor extension unit\n"
           "  --rotation 0|90|180|270   Focus 3 degrees CCW (default 90)\n"
           "  --startup-timeout 1-120   first usable frame deadline (default 10s)\n"
+          "  --probe-bulk              Focus 3 raw USB transfer diagnostic, then exit\n"
+          "  --capture-first           Focus 3: queue capture before vendor activation\n"
           "  --diagnose               print USB/UVC descriptors without activation\n");
   exit(status);
 }
@@ -341,11 +420,14 @@ static int parse_number(const char *text, int base, int low, int high) {
 
 int main(int argc, char **argv) {
   int port = 8085, opt, r, pid = 0, xu_unit = 0, diagnose = 0, startup_timeout = 10;
+  int bulk_diagnostic = 0, capture_first = 0;
   enum tracker_profile requested = TRACKER_AUTO;
   static const struct option options[] = {
     {"tracker", required_argument, NULL, 't'}, {"pid", required_argument, NULL, 'i'},
     {"xu-unit", required_argument, NULL, 'u'}, {"rotation", required_argument, NULL, 'R'},
     {"startup-timeout", required_argument, NULL, 'T'},
+    {"probe-bulk", no_argument, NULL, 'B'},
+    {"capture-first", no_argument, NULL, 'C'},
     {"diagnose", no_argument, NULL, 'd'}, {"help", no_argument, NULL, 'h'}, {NULL, 0, NULL, 0}
   };
   while ((opt = getopt_long(argc, argv, "p:q:rh", options, NULL)) != -1) switch (opt) {
@@ -362,11 +444,15 @@ int main(int argc, char **argv) {
       case 'u': xu_unit = parse_number(optarg, 10, 1, 255); break;
       case 'R': rotation = parse_number(optarg, 10, 0, 270); if (rotation % 90) usage(2); break;
       case 'T': startup_timeout = parse_number(optarg, 10, 1, 120); break;
+      case 'B': bulk_diagnostic = 1; break;
+      case 'C': capture_first = 1; break;
       case 'd': diagnose = 1; break;
       case 'h': usage(0); break;
       default: usage(2);
     }
   if (optind != argc) usage(2);
+  if ((bulk_diagnostic || capture_first) && (diagnose || requested == TRACKER_VFT)) usage(2);
+  if (bulk_diagnostic && capture_first) usage(2);
 
   struct sigaction sa = {.sa_handler = on_signal};
   sigaction(SIGINT, &sa, NULL);
@@ -409,6 +495,10 @@ int main(int argc, char **argv) {
     fprintf(stderr, "vft-stream: %d matching cameras; use --tracker and --pid to select exactly one\n", matches);
     goto cleanup;
   }
+  if ((bulk_diagnostic || capture_first) && profile != TRACKER_FOCUS3) {
+    fprintf(stderr, "vft-stream: capture diagnostics require a Focus 3 tracker\n");
+    goto cleanup;
+  }
   if ((r = uvc_open(dev, &h)) < 0) {
     // ACCESS here is usbfs permissions, not a missing tracker.
     fprintf(stderr, "vft-stream: open tracker: %s%s\n", uvc_strerror(r),
@@ -421,16 +511,19 @@ int main(int argc, char **argv) {
   r = select_control(h, xu_unit, &usb);
   if (r < 0) goto cleanup;
   io.length = r;
+  usb.trace = bulk_diagnostic || capture_first;
 
   uvc_stream_ctrl_t ctrl = {0};
   if (pick_mode(h, &ctrl)) goto cleanup;
   fprintf(stderr, "vft-stream: UVC interface=%u format=%u frame=%u interval=%u max-frame=%u max-payload=%u\n",
           ctrl.bInterfaceNumber, ctrl.bFormatIndex, ctrl.bFrameIndex, ctrl.dwFrameInterval,
           ctrl.dwMaxVideoFrameSize, ctrl.dwMaxPayloadTransferSize);
-  server_fd = open_server(port);
-  if (server_fd < 0) {
-    fprintf(stderr, "vft-stream: HTTP listen: %s\n", strerror(errno));
-    goto cleanup;
+  if (!bulk_diagnostic) {
+    server_fd = open_server(port);
+    if (server_fd < 0) {
+      fprintf(stderr, "vft-stream: HTTP listen: %s\n", strerror(errno));
+      goto cleanup;
+    }
   }
   if (profile == TRACKER_FOCUS3) {
     /* open_ctrl performs VS_COMMIT. Finish configuration before vendor enable;
@@ -441,8 +534,22 @@ int main(int argc, char **argv) {
     }
     fprintf(stderr, "vft-stream: UVC stream committed before Focus 3 activation\n");
   }
+  if (capture_first) {
+    clock_gettime(CLOCK_MONOTONIC, &last_frame);
+    r = uvc_stream_start(capture, on_frame, NULL, 0);
+    if (r < 0) {
+      fprintf(stderr, "vft-stream: start streaming: %s\n", uvc_strerror(r));
+      goto cleanup;
+    }
+    streaming = 1;
+    fprintf(stderr, "vft-stream: USB capture queued before Focus 3 activation\n");
+  }
   activation_attempted = 1;
   if (tracker_set_state(profile, 1, &io)) goto cleanup;
+  if (bulk_diagnostic) {
+    rc = probe_bulk(h, &ctrl, startup_timeout);
+    goto cleanup;
+  }
 
   pthread_t srv;
   if ((r = pthread_create(&srv, NULL, server, (void *)(intptr_t)server_fd))) {
@@ -451,14 +558,16 @@ int main(int argc, char **argv) {
   }
   pthread_detach(srv);
 
-  clock_gettime(CLOCK_MONOTONIC, &last_frame);
-  r = capture ? uvc_stream_start(capture, on_frame, NULL, 0) :
-                uvc_start_streaming(h, &ctrl, on_frame, NULL, 0);
-  if (r < 0) {
-    fprintf(stderr, "vft-stream: start streaming: %s\n", uvc_strerror(r));
-    goto cleanup;
+  if (!streaming) {
+    clock_gettime(CLOCK_MONOTONIC, &last_frame);
+    r = capture ? uvc_stream_start(capture, on_frame, NULL, 0) :
+                  uvc_start_streaming(h, &ctrl, on_frame, NULL, 0);
+    if (r < 0) {
+      fprintf(stderr, "vft-stream: start streaming: %s\n", uvc_strerror(r));
+      goto cleanup;
+    }
+    streaming = 1;
   }
-  streaming = 1;
 
   rc = 0;
   while (!stop) {

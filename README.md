@@ -62,6 +62,8 @@ Options:
 --xu-unit 1–255          override the discovered extension unit
 --rotation 0|90|180|270  Focus 3 rotation in degrees CCW (default 90)
 --startup-timeout 1–120 first usable frame deadline in seconds (default 10)
+--capture-first        Focus 3: queue USB capture before vendor activation
+--probe-bulk           Focus 3: read raw USB transfers for diagnosis, then exit
 --diagnose              inspect descriptors without activating the tracker
 ```
 
@@ -82,9 +84,10 @@ nonzero `received` with `encoded=0` means callbacks reached image processing but
 no usable frame was produced. Short frames remain rejected rather than silently
 discarding the advertised extra row.
 
-The first hardware test of `v0.3.0-focus3.1` reached capture startup but timed out
-without a usable frame. `v0.3.0-focus3.2` changes the commit/activation order and
-adds these diagnostics; successful streaming on Steam Frame still needs testing.
+Hardware tests of `v0.3.0-focus3.1` and `.2` reached capture startup but timed out
+without a usable frame. USB debug output from `.2` showed an empty bulk transfer
+followed by five-second transfer timeouts. `v0.3.0-focus3.3` adds two diagnostics
+for this failure; successful streaming on Steam Frame still needs testing.
 If capture stalls, share the complete application output from this command:
 
 ```sh
@@ -92,9 +95,37 @@ sudo ./vft-stream --tracker focus3 2>focus3-capture.log
 cat focus3-capture.log
 ```
 
-For deeper USB diagnostics, use `sudo LIBUSB_DEBUG=4 ./vft-stream --tracker focus3
-2>focus3-usb.log` and retain the whole log. Cancelled transfers at shutdown do not
-identify the original capture failure; the startup portion is also needed.
+Try the alternative activation timing, which queues USB reads before sending the
+same sensor/IR commands. This is an experimental option; the default order remains
+commit, vendor activation, capture:
+
+```sh
+sudo ./vft-stream --tracker focus3 --capture-first
+```
+
+To isolate raw USB delivery from libuvc's frame parser and transfer queue:
+
+```sh
+sudo ./vft-stream --tracker focus3 --probe-bulk --startup-timeout 5
+```
+
+The probe discovers the bulk IN endpoint on the negotiated interface, commits
+and activates the tracker, and issues one synchronous read at a time. It logs
+the first empty/error reads, up to three nonempty transfer prefixes and a byte
+summary. Bytes returned alongside a timeout are retained in the summary. It
+does not serve MJPEG or run libuvc's frame parser; a zero exit status means some
+USB bytes arrived, not that a complete camera image was decoded. Both diagnostic
+options print the actual vendor command prefixes and perform normal IR/stream
+shutdown. They cannot be combined with each other or with `--diagnose`.
+
+For deeper USB diagnostics, retain the complete log from:
+
+```sh
+sudo LIBUSB_DEBUG=4 ./vft-stream --tracker focus3 2>focus3-usb.log
+```
+
+Cancelled transfers at shutdown do not identify the original capture failure;
+the startup portion is also needed.
 
 ## Optional automatic service
 
@@ -160,7 +191,7 @@ Version tags beginning with `v` run `.github/workflows/release.yml`. The workflo
 builds native and static ARM64 binaries, runs the regression/sanitizer/integration
 checks, and publishes a hardware-test prerelease with the ARM64 executable,
 complete Steam Frame package and checksums. The current release is
-`v0.3.0-focus3.2`. The same workflow can be started manually with an existing
+`v0.3.0-focus3.3`. The same workflow can be started manually with an existing
 version tag if needed. Physical hardware validation remains required.
 
 ## Tests and validation status
@@ -176,7 +207,8 @@ Integration tests install Pillow 11.3.0 into the tools cache, simulate USB deliv
 and exercise the real capture callback, JPEG encoder, HTTP server and cleanup.
 They verify decoded JPEG dimensions/pixels, reconnection, diagnostics without
 activation, device rejection, commit-before-activation ordering, startup failures,
-busy ports, delayed first frames, rejected frames and stalled capture.
+busy ports, delayed first frames, rejected frames, stalled capture, capture-before-
+activation cleanup and direct bulk reads with partial timeouts and USB errors.
 Protocol tests check exact payloads, padding, delays, acknowledgement behavior and
 shutdown after a failed write. Image tests cover all rotations, raw frames, padded
 stride, invalid buffers, area scaling and the reported odd-height mode. A fixture
